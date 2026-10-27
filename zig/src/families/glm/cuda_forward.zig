@@ -24,6 +24,7 @@ const prof_mod = @import("cuda_prof.zig");
 const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const shared = @import("cuda_shared.zig");
+pub const l2_prefetch = @import("cuda_l2_prefetch.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -47,6 +48,7 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    l2: ?l2_prefetch.Prefetch = null,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -75,7 +77,15 @@ pub const Modules = struct {
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.l2 = null;
         return m;
+    }
+
+    /// Configure the optional owner from the rank-agreed settings before preparing its weight ranges.
+    pub fn configureL2(m: *Modules, d: *const cuda.Driver, settings: l2_prefetch.policy.Settings) !void {
+        if (m.l2) |*p| p.deinit();
+        m.l2 = null;
+        if (settings.mode != .disabled) m.l2 = try l2_prefetch.Prefetch.init(d, settings);
     }
 
     /// What weights.load runs: the dense packing, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
@@ -88,6 +98,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.l2) |*p| p.deinit();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
@@ -384,6 +395,11 @@ pub const Forward = struct {
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
         const R = ids.len;
+        const pf: ?*const l2_prefetch.Prefetch = if (f.m.l2) |*p|
+            (if (try p.active(f.stream, R, f.ranks[0].b.prefill)) p else null)
+        else
+            null;
+        errdefer if (pf) |p| p.drain();
         for (f.ranks) |r| {
             if (R == 0 or R > r.b.rows) return error.BadWindow;
             if (r.segs.len == 0) {
@@ -402,13 +418,14 @@ pub const Forward = struct {
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R, pf);
         try f.finish(R);
         if (f.prof) |p| p.mark(f.stream, .head);
+        if (pf) |p| try p.finish(f.stream);
     }
 
     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
-    fn whole(f: *const Forward, R: usize) !void {
+    fn whole(f: *const Forward, R: usize, pf: ?*const l2_prefetch.Prefetch) !void {
         const c = &f.ranks[0].w.config;
         var li: usize = 0;
         var di: usize = 0;
@@ -430,6 +447,7 @@ pub const Forward = struct {
                 try f.ffn(r, l, R, slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
+            if (pf) |p| try p.site(f.stream, j);
             try f.gather(R);
             for (f.ranks) |r| try f.post(r, R);
             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);

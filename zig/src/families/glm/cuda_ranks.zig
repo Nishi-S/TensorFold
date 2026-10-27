@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const heat = @import("heat");
+const mia = @import("cuda_mia_settings.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
@@ -19,6 +20,17 @@ pub const Settings = struct {
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+    exl3_prefetch: bool = false, // TF_EXL3_DECODE_PREFETCH: opt-in mcg four-bit load scheduling
+    q4_pair_decode: bool = false, // TF_GLM_Q4_PAIR_DECODE: opt-in packed Q4 conversion
+
+    dense_format: mia.Format = .symmetric,
+    head_format: mia.Format = .symmetric,
+    exl3_loads: u3 = 0,
+    exl3_fuse: u2 = 0,
+    l2_prefetch: bool = false,
+    l2_mode: u2 = 0,
+    l2_mb: u7 = 8,
+    l2_rows: u7 = 64,
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -78,6 +90,7 @@ pub const Settings = struct {
                 },
             };
         };
+        try mia.read(&s, get, problem);
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -100,7 +113,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 12, // this struct's version
+    layout: u32 = 13, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -117,7 +130,8 @@ pub const Fingerprint = extern struct {
     max_images: u32 = 0,
     max_videos: u32 = 0,
     max_frames: u32 = 0,
-    bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    bits: u32 = 16 << 8 | 16, // dense/head bits plus normalized format, load and fusion selections
+    prefetch: u32 = 64 << 9 | 8 << 2, // bounded L2 prefetch: rows, MiB and mode
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -144,6 +158,7 @@ pub const Fingerprint = extern struct {
         max_videos,
         max_frames,
         bits,
+        prefetch,
         capacity,
         heat_high,
         heat_low,
@@ -174,7 +189,8 @@ pub const Fingerprint = extern struct {
             .pieces = s.pieces,
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
-            .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .bits = mia.bits(s),
+            .prefetch = mia.l2Fingerprint(s),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -210,6 +226,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_videos",
             "max_frames",
             "bits",
+            "prefetch",
             "capacity",
             "heat_high",
             "heat_low",
@@ -317,7 +334,8 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_images => "the image count limit",
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
-        .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .bits => "dense/head quantization formats or EXL3/Q4 decode settings",
+        .prefetch => "TF_GLM_L2PF, TF_GLM_L2PF_MB or TF_GLM_L2PF_ROWS",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
@@ -566,34 +584,6 @@ test "ranks disagree on tensor bytes under identical headers, and agree on a cop
     try std.testing.expect(mismatch(&all) == null);
 }
 
-test "prompt K experiment is explicit and all ranks must agree" {
-    const Reader = struct {
-        fn absent(_: [:0]const u8) ?[]const u8 {
-            return null;
-        }
-        fn one(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_K")) "one" else null;
-        }
-        fn untiled(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_K")) "shape" else if (std.mem.eql(u8, key, "TF_GLM_MM")) "0" else null;
-        }
-
-        fn shape(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_K")) "shape" else null;
-        }
-        fn bad(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_K")) "auto" else null;
-        }
-    };
-    var problem: []const u8 = "";
-    const selected = try Settings.read(Reader.shape, &problem);
-    try std.testing.expect(selected.prompt_fixed_k);
-    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).prompt_fixed_k);
-    try std.testing.expect(!(try Settings.read(Reader.one, &problem)).prompt_fixed_k);
-    try std.testing.expectError(error.BadSetting, Settings.read(Reader.untiled, &problem));
-    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
-    var all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, selected, 8192, true, @splat(0), @splat(0), @splat(0)) };
-    try std.testing.expectEqual(Fingerprint.Field.prompt_fixed_k, mismatch(&all).?.field);
-    all[0].prompt_fixed_k = 1;
-    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
+test {
+    _ = @import("cuda_ranks_experiments_test.zig");
 }

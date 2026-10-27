@@ -31,9 +31,13 @@ const glm_ref_tests = @import("glm_ref_tests.zig");
 const affine8_tests = @import("affine8_tests.zig");
 const affine4_decode_tests = @import("affine4_decode_tests.zig");
 const w4a8_tests = @import("w4a8_tests.zig");
+const glm_l2_prefetch_tests = @import("glm_l2_prefetch_tests.zig");
 const glm_exl3_tests = @import("glm_exl3_tests.zig");
 const glm_vision_tests = @import("glm_vision_tests.zig");
 const glm_mm_fixed = @import("glm_mm_fixed_tests.zig");
+const glm_q4_pair = @import("glm_q4_pair_tests.zig");
+const glm_fp8 = @import("glm_fp8_tests.zig");
+const glm_affine = @import("glm_affine_tests.zig");
 const glm_mm_bench = @import("glm_mm_bench.zig");
 const carveout_tests = @import("carveout_tests.zig");
 const nvfp4_tests = @import("nvfp4_tests.zig");
@@ -226,7 +230,11 @@ const usage =
     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
+    \\  glm-l2-prefetch           GLM side-stream prefetch ownership, range and capture checks
     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
+    \\  glm-q4-pair               Experimental Q4 pair decoding against original bytes and FP64
+    \\  glm-fp8                   Weight-only FP8 products against exact FP64 with stride and row-bucket checks
+    \\  glm-affine                Affine Q4 BF16 scale/bias tiling and execution against FP64
     \\  glm-mm-bench              GLM's bf16 linears: b16.matmul against glm_mm, by rows (one GPU)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
@@ -362,7 +370,11 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "affine4-decode")) return affine4_decode_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "w4a8")) return w4a8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
+    if (std.mem.eql(u8, cmd, "glm-l2-prefetch")) return glm_l2_prefetch_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return glm_mm_fixed.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-q4-pair")) return glm_q4_pair.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-fp8")) return glm_fp8.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-affine")) return glm_affine.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);

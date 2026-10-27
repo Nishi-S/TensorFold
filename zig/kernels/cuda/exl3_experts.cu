@@ -5,6 +5,8 @@
 #include <cuda_fp16.h>
 
 #include "exl3_decode.cuh"
+#include "exl3_prefetch.cuh"
+#include "exl3_fused.cuh"
 
 namespace tf_exl3 {
 
@@ -50,8 +52,9 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
 }
 
 // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-template <int CB, int NT, int W>
-__device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
+template <int CB, int NT, int W, bool PREFETCH = false, int PD = 0, int FUSE = 0>
+__device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz, const FusionArgs* fusion = nullptr,
+        float* fused_red = nullptr, int* fused_rows = nullptr) {
     if (u >= a.ucount[0]) return;
     const int MT = (a.maxm + 15) / 16;
     const int mtile = zz % MT;
@@ -66,7 +69,17 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     const int g = lane >> 2, t = lane & 3;
     const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4); // row stride of the trellis, in tiles
 
-    __shared__ int rows_sh[16];
+    int* rows_sh;
+    float (*red)[16][NT * 16];
+    if constexpr (FUSE == 0) {
+        __shared__ int native_rows[16];
+        __shared__ __align__(16) float native_red[W][16][NT * 16];
+        rows_sh = native_rows;
+        red = native_red;
+    } else {
+        rows_sh = fused_rows;
+        red = reinterpret_cast<float (*)[16][NT * 16]>(fused_red);
+    }
     if (threadIdx.x < 16) {
         const int m = mtile * 16 + threadIdx.x;
         const int count = a.standard ? a.uids[3 * u + 2] : a.maxm;
@@ -91,8 +104,14 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
-    __shared__ __align__(16) float red[W][16][NT * 16];
-    switch (k2) {
+    if (PREFETCH && CB == 1 && k2 == 8) {
+        if constexpr (PD > 0) {
+            if ((reinterpret_cast<uintptr_t>(T) & 15) == 0)
+                warp_tiles_nc<NT, PD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc,
+                    reinterpret_cast<uint32_t*>(&red[warp][0][0]));
+            else warp_tiles_pf1<NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
+        } else warp_tiles_pf1<NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
+    } else switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
         warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
@@ -135,7 +154,12 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
         float s = red[0][row][col];
 #pragma unroll
         for (int w = 1; w < W; ++w) s += red[w][row][col];
-        a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
+        if constexpr (FUSE == 1) red[0][row][col] = s;
+        else a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
+    }
+    if constexpr (FUSE != 0) {
+        __syncthreads();
+        fusion_finish<FUSE>(*fusion, a.z, rows_sh, &red[0][0][0], e, u, nblock, a.p, a.n, a.sk, mtile, MT);
     }
 }
 
@@ -150,6 +174,37 @@ extern "C" __global__ void tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {  // 3inst
 extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, any width
     tf_exl3::grouped_body<1, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
+
+// Opt-in mcg/4-bit decode experiment; all reductions and the grouped ABI stay the same.
+extern "C" __global__ void tf_exl3_grouped_1_pf1(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body<1, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+#define TF_EXL3_NC(PD) \
+extern "C" __global__ void tf_exl3_grouped_1_nc##PD(tf_exl3::GroupedArgs a) { \
+    tf_exl3::grouped_body<1, 8, 4, true, PD>(a, blockIdx.x, blockIdx.y, blockIdx.z); \
+}
+TF_EXL3_NC(1)
+TF_EXL3_NC(2)
+TF_EXL3_NC(4)
+#undef TF_EXL3_NC
+
+struct Exl3FusedArgs { tf_exl3::GroupedArgs mm; tf_exl3::FusionArgs ep; };
+#define TF_EXL3_FUSED(NAME, FUSE) \
+extern "C" __global__ void NAME(Exl3FusedArgs a) { \
+    __shared__ int rows[16]; \
+    __shared__ __align__(16) float red[4][16][128]; \
+    switch (a.ep.load_mode) { \
+        case 1: tf_exl3::grouped_body<1,8,4,true,0,FUSE>(a.mm,blockIdx.x,blockIdx.y,blockIdx.z,&a.ep,&red[0][0][0],rows); break; \
+        case 2: tf_exl3::grouped_body<1,8,4,true,1,FUSE>(a.mm,blockIdx.x,blockIdx.y,blockIdx.z,&a.ep,&red[0][0][0],rows); break; \
+        case 3: tf_exl3::grouped_body<1,8,4,true,2,FUSE>(a.mm,blockIdx.x,blockIdx.y,blockIdx.z,&a.ep,&red[0][0][0],rows); break; \
+        case 4: tf_exl3::grouped_body<1,8,4,true,4,FUSE>(a.mm,blockIdx.x,blockIdx.y,blockIdx.z,&a.ep,&red[0][0][0],rows); break; \
+        default: tf_exl3::grouped_body<1,8,4,false,0,FUSE>(a.mm,blockIdx.x,blockIdx.y,blockIdx.z,&a.ep,&red[0][0][0],rows); break; \
+    } \
+}
+TF_EXL3_FUSED(tf_exl3_down_fused, 1)
+TF_EXL3_FUSED(tf_exl3_gateup_fused, 2)
+#undef TF_EXL3_FUSED
 
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
     tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);

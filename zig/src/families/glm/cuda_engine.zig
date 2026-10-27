@@ -135,13 +135,26 @@ pub const Engine = struct {
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
-        errdefer m.deinit();
+        var modules_moved = false;
+        errdefer if (modules_moved) e.m.deinit() else m.deinit();
+        try m.configureL2(d, @import("cuda_mia_settings.zig").l2Settings(o.settings));
+        if (o.settings.exl3_loads > 4) return error.BadExl3DecodeLoads;
+        const exl3_mode: cuda.exl3_experts.prefetch.Mode = @fromBackingInt(@intCast(if (o.settings.exl3_loads == 0 and o.settings.exl3_prefetch) @as(u3, 1) else o.settings.exl3_loads));
+        try m.exl3.configure(exl3_mode, o.settings.exl3_fuse);
+        m.mm.q4_pair = null;
+        if (o.settings.q4_pair_decode) {
+            m.mm.q4_pair = try m.mods[7].function("glm_mm4_pair_16");
+            try m.mm.q4_pair.?.allowDynamicShared(mm_mod.sharedBytes(4, 16));
+        }
+        if (o.settings.dense_format == .affine4 and m.mm.affine_rows == null) try m.mm.loadAffine(m.mods[7]);
+        if (o.settings.head_format == .fp8 and m.mm.fp8_rows == null) try m.mm.loadFp8(m.mods[7]);
         var pieces = try fw.Pieces.init(d, o.settings.pieces);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        modules_moved = true;
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -152,21 +165,24 @@ pub const Engine = struct {
             enabled: bool,
             dense: u8,
             head: u8,
+            formats: tile.Formats,
             packs: *mm_mod.Packed,
             fn apply(t: @This(), w: *weights.Weights) !void {
-                if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head);
+                if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head, t.formats);
             }
         };
-        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
+        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .formats = .{ .dense = o.settings.dense_format, .head = o.settings.head_format }, .packs = &e.packs };
         e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);
             gpa.free(e.packs.bits);
+            gpa.free(e.packs.formats);
         }
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        if (e.m.l2) |*p| try p.prepare(gpa, &e.w);
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
@@ -206,6 +222,7 @@ pub const Engine = struct {
         e.stream.synchronize() catch {};
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
+        e.gpa.free(e.packs.formats);
         if (e.drafter) |dr| dr.deinit();
         var it = e.snaps.valueIterator();
         while (it.next()) |s| e.freeSnap(s);
@@ -225,6 +242,7 @@ pub const Engine = struct {
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
+        if (e.m.l2) |*p| p.drain();
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();

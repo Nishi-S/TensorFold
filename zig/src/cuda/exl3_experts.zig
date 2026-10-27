@@ -6,6 +6,8 @@ const launch_ = @import("launch.zig");
 const stream_ = @import("stream.zig");
 const kernels = @import("kernels.zig");
 const exl3 = @import("exl3.zig");
+pub const prefetch = @import("exl3_prefetch.zig");
+pub const fusion = @import("exl3_fusion.zig");
 const Driver = driver.Driver;
 const Module = module.Module;
 const Function = module.Function;
@@ -59,6 +61,7 @@ pub const Scratch = struct {
     ids: u64, // int32 [min(P, E)], distinct routed experts in id order
     count: u64, // int32 [1]
     members: u64, // int32 [min(P, E), rows], row * 32 + slot, -1 after the last member
+    done: u64, // gate/up fused last-block counters, reset on the consuming stream
     rows: usize, // the row capacity the buffers hold
     slots: usize, // slots a row, at most 32
 };
@@ -71,7 +74,7 @@ pub fn scratchBytes(l: Layer, rows: usize, slots: usize) !usize {
     const maxu = @min(p, l.experts);
     return align256(p * l.dims * 2) + align256(p * l.dims * 2) + align256(p * l.width * 2) +
         align256(@max(2 * g_sk * l.width, d_sk * l.dims) * p * 4) + align256(p * l.dims * 4) +
-        align256(maxu * 4) + 256 + align256(maxu * rows * 4);
+        align256(maxu * 4) + 256 + align256(maxu * rows * 4) + align256(fusion.counterBytes(maxu, l.width));
 }
 
 fn align256(n: usize) usize {
@@ -100,7 +103,8 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
     const ids = take(&at, maxu * 4);
     const count = take(&at, 4);
     const members = take(&at, maxu * rows * 4);
-    return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .rows = rows, .slots = slots };
+    const done = take(&at, fusion.counterBytes(maxu, l.width));
+    return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .done = done, .rows = rows, .slots = slots };
 }
 
 /// The loaded kernels.
@@ -109,6 +113,12 @@ pub const Experts = struct {
     group: Function,
     rot_in: Function,
     grouped: [3]Function, // one per codebook
+    grouped_prefetch: ?Function = null,
+    decode_prefetch: bool = false, // legacy scalar prefetch selection
+    decode_loads: prefetch.Mode = .baseline,
+    grouped_vector: [3]?Function = @splat(null),
+    decode_fuse: u2 = 0,
+    fused: fusion.Kernels = .{},
     gateup: Function,
     down_combine: Function,
     prompt: prompt.Kernels = undefined,
@@ -137,9 +147,42 @@ pub const Experts = struct {
             try e.mod.function("tf_exl3_grouped_1"),
             try e.mod.function("tf_exl3_grouped_2"),
         };
+        try e.configure(try prefetch.resolve(
+            if (std.c.getenv("TF_EXL3_DECODE_LOADS")) |v| std.mem.span(v) else null,
+            if (std.c.getenv("TF_EXL3_DECODE_PREFETCH")) |v| std.mem.span(v) else null,
+        ), try fusion.parse(if (std.c.getenv("TF_EXL3_DECODE_FUSE")) |v| std.mem.span(v) else null));
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
         return e;
+    }
+
+    /// Resolve only enabled experiments; explicit settings replace environment-derived settings without stale handles.
+    pub fn configure(e: *Experts, mode: prefetch.Mode, fuse_mask: u2) !void {
+        var scalar: ?Function = null;
+        var vectors: [3]?Function = @splat(null);
+        if (prefetch.symbol(mode)) |name| {
+            const f = try e.mod.function(name);
+            if (mode == .scalar) scalar = f else vectors[@backingInt(mode) - 2] = f;
+        }
+        const fused = try fusion.Kernels.resolve(e.mod, fuse_mask);
+        e.decode_prefetch = false;
+        e.decode_loads = mode;
+        e.grouped_prefetch = scalar;
+        e.grouped_vector = vectors;
+        e.decode_fuse = fuse_mask;
+        e.fused = fused;
+    }
+
+    pub fn loadMode(e: *const Experts) prefetch.Mode {
+        return if (e.decode_loads == .baseline and e.decode_prefetch) .scalar else e.decode_loads;
+    }
+
+    pub fn groupedFor(e: *const Experts, l: Layer, rows: usize) !Function {
+        const mode = e.loadMode();
+        if (!prefetch.eligible(mode != .baseline, l.codebook == .mcg, l.uniform_k2, rows))
+            return e.grouped[@backingInt(l.codebook)];
+        return (if (mode == .scalar) e.grouped_prefetch else e.grouped_vector[@backingInt(mode) - 2]) orelse
+            error.MissingExl3PrefetchKernel;
     }
 
     pub fn unload(e: *Experts) void {
@@ -164,6 +207,9 @@ pub const Experts = struct {
         const p = rows * slots;
         const maxu = @min(p, l.experts);
         const mt = (rows + 15) / 16;
+        const grouped = try e.groupedFor(l, rows);
+        const selected = fusion.select(e.decode_fuse, l.codebook == .mcg, l.uniform_k2, rows, d_sk, wts != 0);
+        const load_mode: i32 = @backingInt(e.loadMode());
         const i32d = struct {
             fn f(v: usize) i32 {
                 return @intCast(v);
@@ -217,22 +263,29 @@ pub const Experts = struct {
         g.add(i32d(l.gu_stride));
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        if (selected.gateup) {
+            try fusion.clear(s, sc.done, maxu, w);
+            fusion.append(&g, l.svh_g, l.svh_u, l.suh_d, sc.xd, sc.done, l.limit, l.act_mode, load_mode);
+        }
+        const gateup = if (selected.gateup) e.fused.gateup orelse return error.MissingExl3FusionKernel else grouped;
+        try launch_.launch(gateup, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
-        var ep: launch_.Args = .{};
-        ep.add(sc.z);
-        ep.add(pick);
-        ep.add(l.svh_g);
-        ep.add(l.svh_u);
-        ep.add(l.suh_d);
-        ep.add(sc.xd);
-        ep.add(i32d(p));
-        ep.add(i32d(w));
-        ep.add(i32d(g_sk));
-        ep.add(i32d(l.experts));
-        ep.add(l.limit);
-        ep.add(l.act_mode);
-        try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
+        if (!selected.gateup) {
+            var ep: launch_.Args = .{};
+            ep.add(sc.z);
+            ep.add(pick);
+            ep.add(l.svh_g);
+            ep.add(l.svh_u);
+            ep.add(l.suh_d);
+            ep.add(sc.xd);
+            ep.add(i32d(p));
+            ep.add(i32d(w));
+            ep.add(i32d(g_sk));
+            ep.add(i32d(l.experts));
+            ep.add(l.limit);
+            ep.add(l.act_mode);
+            try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
+        }
 
         var dn: launch_.Args = .{};
         dn.add(sc.xd);
@@ -256,7 +309,10 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        if (selected.down) fusion.append(&dn, l.svh_d, l.svh_d, l.svh_d, sc.y, 0, 0, 0, load_mode);
+        const down = if (selected.down) e.fused.down orelse return error.MissingExl3FusionKernel else grouped;
+        try launch_.launch(down, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        if (selected.down) return;
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);
@@ -313,5 +369,6 @@ test "the scratch layout is 256-aligned and covered by scratchBytes" {
     try std.testing.expectEqual(@as(u64, 0), sc.ids % 256);
     try std.testing.expectEqual(@as(u64, 0), sc.count % 256);
     try std.testing.expectEqual(@as(u64, 0), sc.members % 256);
-    try std.testing.expectEqual(@as(usize, @intFromPtr(&buf) + bytes), sc.members + @as(usize, 9) * 64 * 4);
+    try std.testing.expectEqual(@as(u64, 0), sc.done % 256);
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&buf) + bytes), sc.done + align256(fusion.counterBytes(9, l.width)));
 }

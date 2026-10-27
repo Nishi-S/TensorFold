@@ -2,8 +2,10 @@
 const std = @import("std");
 const cuda = @import("cuda");
 
+pub const Format = enum(u8) { symmetric, affine4, fp8 };
+
 /// A linear's tiles: bf16 pairs (glm_mm_tile16), or `bits`-bit codes (glm_mm_tile4/6/8) with fp16 scales at `s`.
-pub const Tiled = struct { w: u64, n: usize, k: usize, s: u64 = 0, bits: u8 = 16 };
+pub const Tiled = struct { w: u64, n: usize, k: usize, s: u64 = 0, bits: u8 = 16, format: Format = .symmetric };
 
 /// The widths glm_mm packs to, by kernel set: bf16 first.
 const widths = [_]u8{ 16, 4, 6, 8 };
@@ -17,10 +19,21 @@ pub fn packedBytes(n: usize, k: usize, bits: u8) [2]usize {
     return .{ std.mem.alignForward(usize, n * k * bits / 8, 256), n * (k / 64) * 2 };
 }
 
+/// Codes followed by format-specific scale and bias tables; all formats fit inside the source BF16 allocation.
+pub fn formatBytes(n: usize, k: usize, bits: u8, format: Format) [3]usize {
+    const old = packedBytes(n, k, bits);
+    return switch (format) {
+        .symmetric => .{ old[0], old[1], 0 },
+        .affine4 => .{ old[0], old[1], old[1] },
+        .fp8 => .{ old[0], n * (k / 128) * 4, 0 },
+    };
+}
+
 /// The linears packed at load: each one's tiles pointer (sorted) and its bits; a linear not here is bf16.
 pub const Packed = struct {
     ptrs: []const u64 = &.{},
     bits: []const u8 = &.{},
+    formats: []const Format = &.{},
 
     /// The tiled weight `w` [n][k] as the matmul reads it: packed codes with their scales after them, or bf16.
     pub fn tiled(p: *const Packed, w: u64, n: usize, k: usize) Tiled {
@@ -32,7 +45,7 @@ pub const Packed = struct {
         }
         if (lo == p.ptrs.len or p.ptrs[lo] != w) return .{ .w = w, .n = n, .k = k };
         const b = p.bits[lo];
-        return .{ .w = w, .n = n, .k = k, .s = w + packedBytes(n, k, b)[0], .bits = b };
+        return .{ .w = w, .n = n, .k = k, .s = w + packedBytes(n, k, b)[0], .bits = b, .format = if (p.formats.len == 0) .symmetric else p.formats[lo] };
     }
 };
 
@@ -45,6 +58,10 @@ pub const Kernels = struct {
     tile: cuda.Function,
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
+    affine_rows: ?[4]cuda.Function = null,
+    affine_tile: ?cuda.Function = null,
+    fp8_rows: ?[4]cuda.Function = null,
+    q4_pair: ?cuda.Function = null, // opt-in packed bf16 decoding for Q4 decode windows up to 16 rows
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
 
     pub fn load(m: cuda.Module) !Kernels {
@@ -62,7 +79,35 @@ pub const Kernels = struct {
         }
         try k.prompt.allowDynamicShared(smem(128));
         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+        if (std.c.getenv("TF_GLM_Q4_PAIR_DECODE")) |v| {
+            const setting = std.mem.span(v);
+            if (std.mem.eql(u8, setting, "1")) {
+                k.q4_pair = try m.function("glm_mm4_pair_16");
+                try k.q4_pair.?.allowDynamicShared(sharedBytes(4, 16));
+            } else if (!std.mem.eql(u8, setting, "0")) return error.BadQ4PairDecode;
+        }
+        if (std.c.getenv("TF_GLM_DENSE_FORMAT")) |v| if (std.mem.eql(u8, std.mem.span(v), "affine4")) try k.loadAffine(m);
+        if (std.c.getenv("TF_GLM_HEAD_FORMAT")) |v| if (std.mem.eql(u8, std.mem.span(v), "fp8")) try k.loadFp8(m);
         return k;
+    }
+
+    pub fn loadAffine(k: *Kernels, m: cuda.Module) !void {
+        var rows: [4]cuda.Function = undefined;
+        inline for (.{ 16, 32, 64, 128 }, 0..) |bm, i| {
+            rows[i] = try m.function(std.fmt.comptimePrint("glm_mm_affine4_{d}", .{bm}));
+            try rows[i].allowDynamicShared(affineSharedBytes(bm));
+        }
+        k.affine_rows = rows;
+        k.affine_tile = try m.function("glm_mm_tile_affine4");
+    }
+
+    pub fn loadFp8(k: *Kernels, m: cuda.Module) !void {
+        var rows: [4]cuda.Function = undefined;
+        inline for (.{ 16, 32, 64, 128 }, 0..) |bm, i| {
+            rows[i] = try m.function(std.fmt.comptimePrint("glm_fp8_{d}", .{bm}));
+            try rows[i].allowDynamicShared(fp8SharedBytes(bm));
+        }
+        k.fp8_rows = rows;
     }
 };
 
@@ -82,6 +127,21 @@ pub fn sharedBytes(bits: u8, bm: usize) u32 {
     return @intCast(3 * (bm * 128 + 8 * 32 * wpc * 4 + 128));
 }
 
+pub fn affineSharedBytes(bm: usize) u32 {
+    return sharedBytes(4, bm) + @as(u32, @intCast(3 * (128 + bm * 4)));
+}
+
+pub fn fp8SharedBytes(bm: usize) u32 {
+    return @intCast(2 * (bm * 256 + 64 * 128 + 64 * 4));
+}
+
+pub fn weightSplitK(w: Tiled) usize {
+    if (w.format != .fp8) return splitK(w.n, w.k);
+    var sk = splitK(w.n, w.k);
+    while (sk > 1 and (w.k / 128) % sk != 0) sk /= 2;
+    return sk;
+}
+
 /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
 pub fn splitK(n: usize, k: usize) usize {
     const tiles = (n + 63) / 64;
@@ -93,21 +153,25 @@ pub fn splitK(n: usize, k: usize) usize {
 
 /// Bytes of fp32 partials a call of `m` rows needs (0: one slice; windows past 64 rows go 64 at a time).
 pub fn partBytes(m: usize, w: Tiled) usize {
-    const sk = splitK(w.n, w.k);
+    const sk = weightSplitK(w);
     return if (sk > 1) sk * @min(m, 64) * w.n * 4 else 0;
 }
 
-/// x [m][k] (`ldx` apart) by `w` -> out [m][n] (`wide`: fp32); `one`: prompt blocks at any rows, sums per row alike.
+/// x [m][k] by `w` -> out [m][n]; affine/FP8 always keep shape-fixed K slices, including prompt rows.
 pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, part: u64, m: usize, wide: bool, one: bool) !void {
     if (w.k % 64 != 0 or w.n % 8 != 0 or x % 16 != 0 or ldx % 8 != 0) return error.BadShape;
+    if (w.format == .affine4 and (w.bits != 4 or k.affine_rows == null)) return error.AffineFormatNotLoaded;
+    if (w.format == .fp8 and (w.bits != 8 or w.k % 128 != 0 or k.fp8_rows == null)) return error.Fp8FormatNotLoaded;
     var done: usize = 0;
     const wi = try widthIndex(w.bits);
     while (done < m) { // windows to 64 rows a launch with K slices; prompts in one launch of 128-row blocks, one slice
-        const big = if (one) !k.prompt_fixed_k else m - done >= 128;
+        const big = if (w.format != .symmetric)
+            m - done >= 128 and weightSplitK(w) == 1
+        else if (one) !k.prompt_fixed_k else m - done >= 128;
         const rows = if (big) m - done else @min(m - done, 64);
         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
         const bm = bucket(i);
-        const sk = if (big) 1 else splitK(w.n, w.k); // a prompt's blocks share each weight tile in L2: no slices
+        const sk = if (big) 1 else weightSplitK(w); // new formats only take big blocks when their shape needs one slice
         const o = out + done * w.n * @as(usize, if (wide) 4 else 2);
         var a: cuda.Args = .{};
         a.add(x + done * ldx * 2);
@@ -123,11 +187,17 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         a.add(@as(c_int, @intCast(sk)));
         const cols: u32 = @intCast((w.n + 63) / 64);
         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
-        if (big and wi == 0) {
+        if (big and wi == 0 and w.format == .symmetric) {
             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
         } else { // packed prompts take the 128-row bucket's blocks, one slice
-            const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
-            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);
+            const f = if (w.format == .affine4) k.affine_rows.?[i] else if (w.format == .fp8) k.fp8_rows.?[i] else if (!one and m <= 16 and w.bits == 4 and k.q4_pair != null)
+                k.q4_pair.?
+            else if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
+            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = switch (w.format) {
+                .symmetric => sharedBytes(w.bits, bm),
+                .affine4 => affineSharedBytes(bm),
+                .fp8 => fp8SharedBytes(bm),
+            }, .pdl = k.pdl }, s, &a);
         }
         if (sk > 1) {
             const total = rows * w.n;
@@ -156,6 +226,17 @@ pub fn tilePacked(k: *const Kernels, s: cuda.Stream, bits: u8, src: u64, ss: u64
     a.add(@as(c_int, @intCast(n)));
     a.add(@as(c_int, @intCast(kk)));
     try cuda.launch.launch(k.tile_packed[wi - 1], .{ .grid = .{ .x = @intCast((chunks + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
+}
+
+/// Affine Q4 codes and consecutive BF16 scale/bias tables tiled without changing their stored bits.
+pub fn tileAffine(k: *const Kernels, s: cuda.Stream, src: u64, ss: u64, dst: u64, ds: u64, n: usize, kk: usize) !void {
+    const f = k.affine_tile orelse return error.AffineFormatNotLoaded;
+    const chunks = n / 8 * (kk / 64) * 32;
+    var a: cuda.Args = .{};
+    for ([_]u64{ src, ss, dst, ds }) |v| a.add(v);
+    a.add(@as(c_int, @intCast(n)));
+    a.add(@as(c_int, @intCast(kk)));
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((chunks + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
 }
 
 /// A row-major bf16 [n][k] linear at `src` tiled into `dst` (as many bytes).

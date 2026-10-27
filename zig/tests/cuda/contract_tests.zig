@@ -26,6 +26,7 @@ const h3_topk_k = @import("contract_h3_topk.zig");
 const drama3_k = @import("contract_drama3.zig");
 const ck_k = @import("contract_ck.zig");
 const q35_bf16_k = @import("contract_qwen_bf16.zig");
+const decode_experiments = @import("contract_decode_experiments.zig");
 const e3_k = @import("contract_experts3.zig");
 const scan_k = @import("contract_scan.zig");
 const lane8_k = @import("contract_ck_lane.zig");
@@ -33,11 +34,8 @@ const latent_k = @import("contract_latent.zig");
 const vit_k = @import("contract_vit_glue.zig");
 const act_round_k = @import("contract_act_round.zig");
 const f32w_k = @import("contract_glm_f32w.zig");
-
 const w4a8_k = @import("contract_w4a8.zig");
-
 const round_k = @import("contract_tree_round.zig");
-
 const act_k = @import("contract_act.zig");
 const vit_g4_group = @import("contract_gemma_group.zig");
 const gdn_k = @import("contract_gdn.zig");
@@ -48,11 +46,9 @@ const glm_index_k = @import("contract_glm_index.zig");
 const glm_attn_k = @import("contract_glm_attn.zig");
 const glm = @import("glm_cuda");
 const elementwise_k = @import("contract_elementwise.zig");
-
 const tree_k = @import("contract_tree_attn.zig");
 const block_k = @import("contract_block_attn.zig");
 const q35_k = @import("contract_q35_attn.zig");
-
 const window_k = @import("contract_window.zig");
 const moe_k = @import("contract_moe.zig");
 const qkr_k = @import("contract_qk_round.zig");
@@ -60,7 +56,6 @@ const fact_k = @import("contract_flashnext_fact.zig");
 const route_k = @import("contract_route_rows.zig");
 const fexp_k = @import("contract_flashnext_fexp.zig");
 const glue_k = @import("contract_flashnext_glue.zig");
-
 const q35_contiguous = @import("contract_q35_contiguous.zig");
 const contract = core.contract;
 const g = contract.gates;
@@ -109,6 +104,12 @@ pub fn run(gpu: check.Gpu) !void {
     defer rank_sum.unload();
     var kernels: std.ArrayList(g.Kernel) = .empty;
     defer kernels.deinit(a);
+    var mia_formats: @import("contract_mia_formats.zig").Group = .{};
+    defer mia_formats.deinit();
+    try mia_formats.add(gpu, s, &kernels);
+    var decode_group: decode_experiments.Group = .{};
+    defer decode_group.deinit();
+    try decode_group.add(gpu, s, &kernels);
     var vit = try cuda.vit.Kernels.load(gpu.d);
     defer vit.unload();
     var glue: [12]vit_k.Glue = undefined;

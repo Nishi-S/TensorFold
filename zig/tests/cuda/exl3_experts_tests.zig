@@ -14,6 +14,22 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     var exp = try exl3e.Experts.load(r.gpu.d);
     defer exp.unload();
 
+    {
+        var ok = true;
+        prefetchEqual(r, &exp) catch |e| {
+            state.fail(e, "exl3.experts.prefetch.bytes");
+            ok = false;
+        };
+        if (ok) check.pass("exl3.experts.prefetch.bytes", .{});
+    }
+    {
+        var ok = true;
+        @import("exl3_fusion_tests.zig").run(r, &exp) catch |e| {
+            state.fail(e, "exl3.experts.fusion.bytes");
+            ok = false;
+        };
+        if (ok) check.pass("exl3.experts.fusion.bytes", .{});
+    }
     // every expert one width: 4, 5 and 6 bits (the mixed run folds into .6)
     ref.checks(r, &exp, state);
     {
@@ -47,6 +63,42 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
             ok = false;
         };
         if (ok) check.pass("exl3.experts.python", .{});
+    }
+}
+
+/// The experimental grouped kernel keeps per-slot and reduced outputs, including inactive rows and routing tails.
+fn prefetchEqual(r: *Rig, exp: *const exl3e.Experts) !void {
+    var baseline = exp.*;
+    baseline.decode_prefetch = false;
+    baseline.decode_loads = .baseline;
+    baseline.decode_fuse = 0;
+    var candidate = exp.*;
+    candidate.decode_prefetch = false;
+    candidate.decode_fuse = 0;
+    candidate.grouped_prefetch = try exp.mod.function("tf_exl3_grouped_1_pf1");
+    inline for (.{ "tf_exl3_grouped_1_nc1", "tf_exl3_grouped_1_nc2", "tf_exl3_grouped_1_nc4" }, 0..) |name, i|
+        candidate.grouped_vector[i] = try exp.mod.function(name);
+    const variants = [_][ref.E]u32{
+        .{ 4, 4, 4, 4, 4, 4, 4, 4, 4 },
+        .{ 4, 5, 6, 4, 5, 6, 4, 5, 6 },
+    };
+    for (variants, 0..) |bits, variant| {
+        var b = try ref.buildLayer(r, &bits);
+        b.layer.codebook = .mcg;
+        b.layer.uniform_k2 = if (variant == 0) 8 else 0;
+        for ([_]usize{ 1, 3, 8, 16, 17 }) |rows| {
+            const old = try ref.runSlice(r, &baseline, b.layer, b.dx, b.dpick, b.dwts, rows);
+            const out = try r.back(old.out, rows * ref.D * 4);
+            const slots = try r.back(old.y, rows * ref.SLOTS * ref.D * 4);
+            for ([_]exl3e.prefetch.Mode{ .scalar, .nc1, .nc2, .nc4 }) |mode| {
+                candidate.decode_loads = mode;
+                for (0..5) |_| {
+                    const new = try ref.runSlice(r, &candidate, b.layer, b.dx, b.dpick, b.dwts, rows);
+                    try check.sameBytes("EXL3 prefetch outputs", try r.back(new.out, out.len), out);
+                    try check.sameBytes("EXL3 prefetch slots", try r.back(new.y, slots.len), slots);
+                }
+            }
+        }
     }
 }
 
