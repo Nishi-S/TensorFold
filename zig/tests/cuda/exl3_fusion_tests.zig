@@ -36,19 +36,22 @@ pub fn run(r: *Rig, loaded: *const exl3.Experts) !void {
                 for ([_]bool{ false, true }) |weighted| {
                     const weights = if (weighted) b.dwts else 0;
                     try baseline.run(r.s, b.layer, b.dx, ref.D, .bf16, b.dpick, weights, rows, out, sc);
+                    const old_xd = try r.back(sc.xd, rows * ref.SLOTS * b.layer.width * 2);
                     const old_slots = try r.back(sc.y, rows * ref.SLOTS * ref.D * 4);
                     const old_out = if (weighted) try r.back(out, rows * ref.D * 4) else &.{};
                     for ([_]u2{ 1, 2, 3 }) |mask| {
                         candidate.decode_fuse = mask;
                         for ([_]exl3.prefetch.Mode{ .baseline, .scalar, .nc1, .nc2, .nc4 }) |mode| {
                             candidate.decode_loads = mode;
-                            for (0..5) |_| {
+                            for (0..5) |repeat| {
+                                const context: Context = .{ .variant = variant, .act_mode = act_mode, .rows = rows, .weighted = weighted, .mask = mask, .mode = mode, .repeat = repeat };
                                 try r.gpu.d.check(r.gpu.d.api.cuMemsetD32Async(sc.done, 0xa5a5a5a5, exl3.fusion.counterBytes(ref.E, b.layer.width) / 4, r.s.handle), "poison fusion counters");
                                 try candidate.run(r.s, b.layer, b.dx, ref.D, .bf16, b.dpick, weights, rows, out, sc);
-                                try check.sameBytes("EXL3 fused slot outputs", try readInto(r, sc.y, actual[0..old_slots.len]), old_slots);
-                                if (weighted) try check.sameBytes("EXL3 fused weighted outputs", try readInto(r, out, actual[0..old_out.len]), old_out);
+                                try context.compare("EXL3 gate/up down-input", try readInto(r, sc.xd, actual[0..old_xd.len]), old_xd);
+                                try context.compare("EXL3 fused slot outputs", try readInto(r, sc.y, actual[0..old_slots.len]), old_slots);
+                                if (weighted) try context.compare("EXL3 fused weighted outputs", try readInto(r, out, actual[0..old_out.len]), old_out);
                             }
-                            if (variant == 0 and act_mode == 0 and rows == 3 and !weighted and mask == 3 and mode == .nc4) {
+                            if (variant == 0 and act_mode == 0 and (rows == 3 or rows == 16) and !weighted and mask == 3 and mode == .nc4) {
                                 try cuda.graph.beginCapture(r.s, .thread_local);
                                 candidate.run(r.s, b.layer, b.dx, ref.D, .bf16, b.dpick, 0, rows, out, sc) catch |err| {
                                     var discarded = cuda.graph.endCapture(r.s) catch return err;
@@ -59,10 +62,12 @@ pub fn run(r: *Rig, loaded: *const exl3.Experts) !void {
                                 defer graph.deinit();
                                 var exec = try graph.instantiate();
                                 defer exec.deinit();
-                                for (0..5) |_| {
+                                for (0..5) |repeat| {
+                                    const context: Context = .{ .variant = variant, .act_mode = act_mode, .rows = rows, .weighted = weighted, .mask = mask, .mode = mode, .repeat = repeat, .captured = true };
                                     try r.gpu.d.check(r.gpu.d.api.cuMemsetD32Async(sc.done, 0xa5a5a5a5, exl3.fusion.counterBytes(ref.E, b.layer.width) / 4, r.s.handle), "poison graph counters");
                                     try exec.launchOn(r.s);
-                                    try check.sameBytes("EXL3 fused graph slots", try readInto(r, sc.y, actual[0..old_slots.len]), old_slots);
+                                    try context.compare("EXL3 graph gate/up down-input", try readInto(r, sc.xd, actual[0..old_xd.len]), old_xd);
+                                    try context.compare("EXL3 fused graph slots", try readInto(r, sc.y, actual[0..old_slots.len]), old_slots);
                                 }
                             }
                         }
@@ -79,3 +84,22 @@ fn readInto(r: *Rig, ptr: u64, bytes: []u8) ![]const u8 {
     try b.download(0, bytes);
     return bytes;
 }
+
+// Print the complete failing configuration without changing the byte-equality threshold.
+const Context = struct {
+    variant: usize,
+    act_mode: i32,
+    rows: usize,
+    weighted: bool,
+    mask: u2,
+    mode: exl3.prefetch.Mode,
+    repeat: usize,
+    captured: bool = false,
+
+    fn compare(c: Context, stage: []const u8, actual: []const u8, expected: []const u8) !void {
+        check.sameBytes(stage, actual, expected) catch |err| {
+            std.debug.print("EXL3 fusion failure: stage={s} variant={d} act_mode={d} rows={d} weighted={} mask={d} loads={t} repeat={d} captured={}\n", .{ stage, c.variant, c.act_mode, c.rows, c.weighted, c.mask, c.mode, c.repeat, c.captured });
+            return err;
+        };
+    }
+};

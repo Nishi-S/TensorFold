@@ -59,7 +59,14 @@ This patch covers the priority paths above, not all 123 Python recipe patches.
 The specialized FP8 `kv_b` path and per-shape dense launch tuning remain outside
 this patch; they must not be inferred from the FP8 head setting.
 
-To explicitly select the combined profile, on each rank run your native command
+Issue [#2](https://github.com/Nishi-S/TensorFold/issues/2) reports a reproducible
+SM121 fusion byte-equality failure with nvcc 13.3.73. The wrapper now defaults
+`TF_EXL3_DECODE_FUSE=0`; fusion requires an explicit override until requalified.
+This mitigates the reported path; it does not establish its numerical root cause
+or whole-model correctness. The standalone fusion tests still exercise masks
+1/2/3 with exact comparisons and report the failing configuration and stage.
+
+To explicitly select the combined profile (with fusion disabled), on each rank run your native command
 through the wrapper (it only sets environment variables, then executes it):
 
 ```sh
