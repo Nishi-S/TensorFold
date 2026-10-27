@@ -196,6 +196,15 @@ pub const Experts = struct {
 
     /// The routed experts of `rows` rows: group, rotate in, grouped gate/up, SwiGLU, grouped down, wts-weighted sum.
     pub fn run(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch) !void {
+        return e.runImpl(false, s, l, x, x_stride, x_dtype, pick, wts, rows, out, sc);
+    }
+
+    /// Diagnostic entrypoint: keep gate/up partials in sc.z before down overwrites them; sc.xd is also complete.
+    pub fn runGateUpForTest(e: *const Experts, s: Stream, l: Layer, x: u64, stride: usize, dtype: DType, pick: u64, rows: usize, sc: Scratch) !void {
+        return e.runImpl(true, s, l, x, stride, dtype, pick, 0, rows, 0, sc);
+    }
+
+    fn runImpl(e: *const Experts, comptime stop_after_gateup: bool, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch) !void {
         const d = l.dims;
         const w = l.width;
         const slots = sc.slots;
@@ -286,6 +295,8 @@ pub const Experts = struct {
             ep.add(l.act_mode);
             try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
         }
+
+        if (stop_after_gateup) return;
 
         var dn: launch_.Args = .{};
         dn.add(sc.xd);

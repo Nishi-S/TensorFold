@@ -39,7 +39,7 @@ test "prompt K experiment is explicit and all ranks must agree" {
 }
 
 test "decode experiment flags reject typos and disagree across ranks in either direction" {
-    inline for (.{ .{ "TF_EXL3_DECODE_PREFETCH", "exl3_prefetch" }, .{ "TF_GLM_Q4_PAIR_DECODE", "q4_pair_decode" } }) |entry| {
+    inline for (.{ .{ "TF_EXL3_DECODE_PREFETCH", "exl3_prefetch" }, .{ "TF_GLM_Q4_PAIR_DECODE", "q4_pair_decode" }, .{ "TF_GLM_AFFINE_PRUNE", "affine_prune" }, .{ "TF_GLM_PACKED_PROMPT_BATCH", "packed_prompt_batch" } }) |entry| {
         const Reader = struct {
             var value: ?[]const u8 = null;
             fn get(key: [:0]const u8) ?[]const u8 {
@@ -174,4 +174,13 @@ test "L2 budgets are validated even disabled and every rank agrees on bytes and 
         all[1] = Fingerprint.of(2, 1, other, 8192, true, @splat(0), @splat(0), @splat(0));
         try std.testing.expectEqual(Fingerprint.Field.prefetch, mismatch(&all).?.field);
     }
+}
+
+test "packing and prompt scheduling experiments use independent rank bits" {
+    const a = Fingerprint.of(2, 0, .{ .affine_prune = true }, 8192, true, @splat(0), @splat(0), @splat(0));
+    const b = Fingerprint.of(2, 1, .{ .packed_prompt_batch = true }, 8192, true, @splat(0), @splat(0), @splat(0));
+    const all = [_]Fingerprint{ a, b };
+    try std.testing.expectEqual(Fingerprint.Field.bits, mismatch(&all).?.field);
+    try std.testing.expectEqual(@as(u32, 16 << 8 | 16), a.bits & 0x07ffffff);
+    try std.testing.expectEqual(@as(u32, 16 << 8 | 16), b.bits & 0x07ffffff);
 }

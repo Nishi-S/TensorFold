@@ -4,7 +4,7 @@ const cuda = @import("cuda");
 const glm = @import("glm_cuda");
 const codec = @import("core").exlr8.codec;
 const check = @import("check.zig");
-const capacity = 130;
+const capacity = 261;
 const guard = 128;
 const marker = 0xa5;
 
@@ -23,6 +23,7 @@ fn shape(gpu: check.Gpu, module: cuda.Module, n: usize, k: usize) !void {
     defer stream.deinit();
     var kernels = try glm.mm.Kernels.load(module);
     try kernels.loadFp8(module);
+    kernels.packed_prompt_batch = true;
     const stride = k + 8;
     const x = try a.alloc(u16, capacity * stride);
     defer a.free(x);
@@ -63,7 +64,7 @@ fn shape(gpu: check.Gpu, module: cuda.Module, n: usize, k: usize) !void {
         kernels.pdl = pdl;
         for ([_]bool{ false, true }) |wide| {
             const size: usize = if (wide) 4 else 2;
-            for ([_]bool{ false, true }) |prompt| for ([_]usize{ 1, 3, 16, 17, 33, 64, 128, 129 }) |rows| {
+            for ([_]bool{ false, true }) |prompt| for ([_]usize{ 1, 3, 16, 17, 33, 64, 126, 127, 128, 129, 254, 255, 256, 257 }) |rows| {
                 for ([_]usize{ 0, 1 }) |offset| for (0..5) |_| {
                     try output.fill8(marker, stream.handle);
                     try glm.mm.matmul(&kernels, stream, dx.ptr + offset * stride * 2, stride, weight, output.ptr + guard, part.ptr, rows, wide, prompt);
@@ -101,6 +102,7 @@ fn rowInvariant(gpu: check.Gpu, module: cuda.Module, k: usize) !void {
     defer stream.deinit();
     var kernels = try glm.mm.Kernels.load(module);
     try kernels.loadFp8(module);
+    kernels.packed_prompt_batch = true;
     var prng = std.Random.DefaultPrng.init(0xf8a771 + k);
     const random = prng.random();
     const x = try a.alloc(u16, capacity * stride);
@@ -151,7 +153,7 @@ fn rowInvariant(gpu: check.Gpu, module: cuda.Module, k: usize) !void {
         try output.download(0, baseline);
         for ([_]bool{ false, true }) |pdl| {
             kernels.pdl = pdl;
-            for ([_]bool{ false, true }) |prompt| for ([_]usize{ 1, 3, 16, 17, 33, 64, 128, 129 }) |rows| {
+            for ([_]bool{ false, true }) |prompt| for ([_]usize{ 1, 3, 16, 17, 33, 64, 126, 127, 128, 129, 254, 255, 256, 257 }) |rows| {
                 for ([_]usize{ 0, 1 }) |offset| {
                     try glm.mm.matmul(&kernels, stream, dx.ptr + offset * stride * 2, stride, weight, output.ptr, part.ptr, rows, wide, prompt);
                     try stream.synchronize();

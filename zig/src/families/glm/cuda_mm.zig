@@ -58,6 +58,7 @@ pub const Kernels = struct {
     tile: cuda.Function,
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
+    packed_prompt_batch: bool = false, // opt-in affine/FP8 split windows using two 64-row blocks
     affine_rows: ?[4]cuda.Function = null,
     affine_tile: ?cuda.Function = null,
     fp8_rows: ?[4]cuda.Function = null,
@@ -151,10 +152,13 @@ pub fn splitK(n: usize, k: usize) usize {
     return sk;
 }
 
-/// Bytes of fp32 partials a call of `m` rows needs (0: one slice; windows past 64 rows go 64 at a time).
+/// Two 64-row blocks stay within the native planner's 127-row split-K budget per shape.
+pub const packed_split_rows = 127;
+
+/// Scratch for 64 symmetric rows or packed_split_rows affine/FP8 rows, conservatively including disabled batching.
 pub fn partBytes(m: usize, w: Tiled) usize {
     const sk = weightSplitK(w);
-    return if (sk > 1) sk * @min(m, 64) * w.n * 4 else 0;
+    return if (sk > 1) sk * @min(m, if (w.format == .symmetric) @as(usize, 64) else packed_split_rows) * w.n * 4 else 0;
 }
 
 /// x [m][k] by `w` -> out [m][n]; affine/FP8 always keep shape-fixed K slices, including prompt rows.
@@ -164,11 +168,12 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
     if (w.format == .fp8 and (w.bits != 8 or w.k % 128 != 0 or k.fp8_rows == null)) return error.Fp8FormatNotLoaded;
     var done: usize = 0;
     const wi = try widthIndex(w.bits);
-    while (done < m) { // windows to 64 rows a launch with K slices; prompts in one launch of 128-row blocks, one slice
+    while (done < m) { // split windows preserve K slices; unsplit calls may use 128-row blocks
         const big = if (w.format != .symmetric)
             m - done >= 128 and weightSplitK(w) == 1
         else if (one) !k.prompt_fixed_k else m - done >= 128;
-        const rows = if (big) m - done else @min(m - done, 64);
+        const cap: usize = if (k.packed_prompt_batch and w.format != .symmetric and weightSplitK(w) > 1) packed_split_rows else 64;
+        const rows = if (big) m - done else @min(m - done, cap);
         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
         const bm = bucket(i);
         const sk = if (big) 1 else weightSplitK(w); // new formats only take big blocks when their shape needs one slice

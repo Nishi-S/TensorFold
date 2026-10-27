@@ -6,7 +6,8 @@ const mm_mod = @import("cuda_mm.zig");
 const qpack = @import("cuda_qpack.zig");
 const affine_pack = @import("cuda_affine_pack.zig");
 const fp8_pack = @import("cuda_fp8_pack.zig");
-pub const Formats = struct { dense: mm_mod.Format = .symmetric, head: mm_mod.Format = .symmetric };
+const pack_timing = @import("cuda_pack_timing.zig");
+pub const Formats = struct { dense: mm_mod.Format = .symmetric, head: mm_mod.Format = .symmetric, affine_prune: bool = false };
 const projection = @import("cuda_proj.zig");
 const Weights = weights.Weights;
 const Layer = weights.Layer;
@@ -100,6 +101,7 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
     if (formats.dense == .fp8 or formats.head == .affine4) return error.UnsupportedPackedFormat;
     if (formats.dense == .affine4 and dense_bits != 4) return error.AffineNeedsFourBits;
     if (formats.head == .fp8 and head_bits != 8) return error.Fp8NeedsEightBits;
+    var timing = pack_timing.Timing.init();
     var list: std.ArrayList(Lin) = .empty;
     defer list.deinit(w.gpa);
     try linears(w, &list);
@@ -127,6 +129,7 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
     var packed_bits: std.ArrayList(u8) = .empty;
     errdefer packed_bits.deinit(gpa);
     var freed: usize = 0;
+    timing.mark(.setup);
     for (list.items, 0..) |e, i| {
         const n = e.n;
         const k = e.k;
@@ -137,11 +140,16 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
         if (bits == 16) {
             try mm_mod.tile(mk, s, ptr, tmp.ptr, n, k);
             try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
+            if (timing.enabled) {
+                try s.synchronize();
+                timing.mark(.bf16_tile);
+            }
             continue;
         }
         try host.resize(gpa, n * k);
         try s.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
+        timing.mark(.readback);
         const sizes = mm_mod.formatBytes(n, k, bits, format);
         switch (format) {
             .symmetric, .affine4 => {
@@ -149,8 +157,9 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
                 try scales.resize(gpa, n * (k / 64));
                 if (format == .affine4) {
                     try biases.resize(gpa, scales.items.len);
-                    try affine_pack.quantize(host.items, n, k, words.items, scales.items, biases.items);
+                    if (formats.affine_prune) try affine_pack.quantizePruned(host.items, n, k, words.items, scales.items, biases.items) else try affine_pack.quantize(host.items, n, k, words.items, scales.items, biases.items);
                 } else qpack.quantize(bits, host.items, n, k, words.items, scales.items);
+                timing.mark(if (format == .affine4) .affine_quant else .symmetric_quant);
                 try tmp.upload(0, std.mem.sliceAsBytes(words.items));
                 try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
                 if (format == .affine4) {
@@ -162,13 +171,16 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
                 try codes8.resize(gpa, n * k);
                 try scales8.resize(gpa, n * (k / 128));
                 try fp8_pack.quantize(host.items, n, k, codes8.items, scales8.items);
+                timing.mark(.fp8_quant);
                 try tmp.upload(0, codes8.items);
                 try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales8.items));
                 try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, sizes[0] + sizes[1], s.handle), "cuMemcpyDtoDAsync");
             },
         }
         try s.synchronize(); // tmp is the next linear's
+        timing.mark(.upload_tile);
         freed += try compact(w, d, s, e.field, sizes[0] + sizes[1] + sizes[2]); // its bf16 bytes back to the device
+        timing.mark(.compact);
         try packed_ptrs.append(gpa, e.field.*);
         try packed_bits.append(gpa, bits);
         try packed_formats.append(gpa, format);
@@ -195,6 +207,8 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
         }
     };
     std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out, .f = formats_out });
+    timing.mark(.setup);
+    timing.report(w.share.rank, list.items.len);
     return .{ .ptrs = ptrs, .bits = bits_out, .formats = formats_out };
 }
 

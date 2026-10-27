@@ -48,7 +48,8 @@ nonfinite classes follow that factored formula, not algebraic reassociation of
 infinities. This is not a claim of byte-identical whole-model output to Mia.
 FP8 keeps Mia's per-128 scale storage but scales each 64-value product group.
 Both new formats retain shape-selected K slices across prompt/decode. Matrices
-needing split K use at most 64-row windows and ordered reduction; unsplit large
+needing split K default to 64-row windows and ordered reduction; the opt-in
+`TF_GLM_PACKED_PROMPT_BATCH=1` experiment uses at most 127 rows. Unsplit large
 calls use 128-row blocks. Mia's single-kernel sequential prompt folding is not
 ported, so this correctness-first prompt implementation may have extra launches.
 
@@ -60,11 +61,15 @@ The specialized FP8 `kv_b` path and per-shape dense launch tuning remain outside
 this patch; they must not be inferred from the FP8 head setting.
 
 Issue [#2](https://github.com/Nishi-S/TensorFold/issues/2) reports a reproducible
-SM121 fusion byte-equality failure with nvcc 13.3.73. The wrapper now defaults
+SM121 generic FP32 gate/up fusion byte-equality failure with nvcc 13.3.73;
+the reported GLM BF16 comparisons passed. The wrapper still defaults
 `TF_EXL3_DECODE_FUSE=0`; fusion requires an explicit override until requalified.
 This mitigates the reported path; it does not establish its numerical root cause
 or whole-model correctness. The standalone fusion tests still exercise masks
 1/2/3 with exact comparisons and report the failing configuration and stage.
+
+See [the issues 2/3 follow-up](glm-mia-issues-2-3.md) for the corrected failure
+scope, supplied device evidence and next measurements.
 
 To explicitly select the combined profile (with fusion disabled), on each rank run your native command
 through the wrapper (it only sets environment variables, then executes it):

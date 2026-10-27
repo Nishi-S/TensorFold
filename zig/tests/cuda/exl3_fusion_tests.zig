@@ -29,6 +29,7 @@ pub fn run(r: *Rig, loaded: *const exl3.Experts) !void {
         const scratch_base = try r.zeros(try exl3.scratchBytes(b.layer, 17, ref.SLOTS));
         const sc = try exl3.scratch(scratch_base, b.layer, 17, ref.SLOTS);
         const out = try r.zeros(17 * ref.D * 4);
+        if (variant == 0) try isolateFp32GateUp(r, &baseline, &candidate, b, sc);
         for ([_]i32{ 0, 1 }) |act_mode| {
             b.layer.act_mode = act_mode;
             b.layer.limit = if (act_mode == 0) 10 else 0;
@@ -76,6 +77,29 @@ pub fn run(r: *Rig, loaded: *const exl3.Experts) !void {
             }
         }
     }
+}
+
+// Issue #2's same random fixture: isolate projection/publication from the epilogue before the common down kernel.
+fn isolateFp32GateUp(r: *Rig, baseline: *const exl3.Experts, configured: *const exl3.Experts, b: ref.Built, sc: exl3.Scratch) !void {
+    var layer = b.layer;
+    layer.act_mode = 1;
+    layer.limit = 0;
+    const rows = 16;
+    const splits = try exl3.plan(layer.dims, layer.width, true);
+    const partial_bytes = 2 * splits * rows * ref.SLOTS * layer.width * 4;
+    const input_bytes = rows * ref.SLOTS * layer.width * 2;
+    try baseline.runGateUpForTest(r.s, layer, b.dx, ref.D, .bf16, b.dpick, rows, sc);
+    const old_z = try r.back(sc.z, partial_bytes);
+    const old_xd = try r.back(sc.xd, input_bytes);
+    var candidate = configured.*;
+    candidate.decode_fuse = 2;
+    candidate.decode_loads = .baseline;
+    const context: Context = .{ .variant = 0, .act_mode = 1, .rows = rows, .weighted = false, .mask = 2, .mode = .baseline, .repeat = 0 };
+    try r.gpu.d.check(r.gpu.d.api.cuMemsetD32Async(sc.done, 0xa5a5a5a5, exl3.fusion.counterBytes(ref.E, layer.width) / 4, r.s.handle), "poison isolation counters");
+    try candidate.runGateUpForTest(r.s, layer, b.dx, ref.D, .bf16, b.dpick, rows, sc);
+    try context.compare("EXL3 pre-down gate/up partials", try r.back(sc.z, partial_bytes), old_z);
+    try context.compare("EXL3 pre-down FP16 input", try r.back(sc.xd, input_bytes), old_xd);
+    check.pass("EXL3 pre-down FP32 isolation: partials and down inputs byte-equal", .{});
 }
 
 fn readInto(r: *Rig, ptr: u64, bytes: []u8) ![]const u8 {

@@ -141,6 +141,7 @@ pub const Engine = struct {
         if (o.settings.exl3_loads > 4) return error.BadExl3DecodeLoads;
         const exl3_mode: cuda.exl3_experts.prefetch.Mode = @fromBackingInt(@intCast(if (o.settings.exl3_loads == 0 and o.settings.exl3_prefetch) @as(u3, 1) else o.settings.exl3_loads));
         try m.exl3.configure(exl3_mode, o.settings.exl3_fuse);
+        m.mm.packed_prompt_batch = o.settings.packed_prompt_batch;
         m.mm.q4_pair = null;
         if (o.settings.q4_pair_decode) {
             m.mm.q4_pair = try m.mods[7].function("glm_mm4_pair_16");
@@ -171,7 +172,7 @@ pub const Engine = struct {
                 if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head, t.formats);
             }
         };
-        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .formats = .{ .dense = o.settings.dense_format, .head = o.settings.head_format }, .packs = &e.packs };
+        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .formats = .{ .dense = o.settings.dense_format, .head = o.settings.head_format, .affine_prune = o.settings.affine_prune }, .packs = &e.packs };
         e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {

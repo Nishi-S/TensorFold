@@ -85,3 +85,66 @@ test "fixed K prompt experiment uses the same shape split across bucket, offset 
     };
     try std.testing.expect(!kernels.prompt_fixed_k);
 }
+
+test "packed split windows cover row seams with unchanged K slices and bounded scratch" {
+    var k = kernels;
+    try std.testing.expect(!k.packed_prompt_batch);
+    k.affine_rows = .{ .{ .id = 2016 }, .{ .id = 2032 }, .{ .id = 2064 }, .{ .id = 2128 } };
+    k.fp8_rows = .{ .{ .id = 4016 }, .{ .id = 4032 }, .{ .id = 4064 }, .{ .id = 4128 } };
+    for ([_]mm.Format{ .affine4, .fp8 }) |format| {
+        const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = if (format == .affine4) 4 else 8, .format = format };
+        for ([_]usize{ 126, 127, 128, 129, 254, 255, 256, 257, 1862 }) |rows| {
+            for ([_]bool{ false, true }) |batched| for ([_]bool{ false, true }) |prompt| for ([_]bool{ false, true }) |wide| {
+                k.packed_prompt_batch = batched;
+                const cap: usize = if (batched) 127 else 64;
+                cuda.count = 0;
+                const input = 4096 + 7 * 2056 * 2;
+                try mm.matmul(&k, .{}, input, 2056, w, 65536, 131072, rows, wide, prompt);
+                try std.testing.expectEqual(2 * ((rows + cap - 1) / cap), cuda.count);
+                var covered: usize = 0;
+                var launch: usize = 0;
+                while (launch < cuda.count) : (launch += 2) {
+                    const a = cuda.args[launch].values;
+                    const reduction = cuda.args[launch + 1].values;
+                    const count: usize = @intCast(a[7]);
+                    try std.testing.expect(count > 0 and count <= cap);
+                    try std.testing.expectEqual(input + covered * 2056 * 2, a[0]);
+                    try std.testing.expectEqual(@as(u64, 2056), a[1]);
+                    try std.testing.expectEqual(@as(u64, 65536 + covered * 4096 * @as(usize, if (wide) 4 else 2)), a[4]);
+                    try std.testing.expectEqual(@as(u64, 131072), a[5]);
+                    try std.testing.expectEqual(@as(u64, 4), a[10]);
+                    try std.testing.expectEqual(@as(u32, 4), cuda.configs[launch].grid.z);
+                    try std.testing.expectEqual(@as(u32, if (count > 64) 2 else 1), cuda.configs[launch].grid.y);
+                    const bucket: u32 = if (count <= 16) 16 else if (count <= 32) 32 else 64;
+                    try std.testing.expectEqual(@as(u32, if (format == .affine4) 2000 else 4000) + bucket, cuda.symbols[launch]);
+                    try std.testing.expectEqual(@as(u32, 1024), cuda.symbols[launch + 1]);
+                    try std.testing.expectEqual(a[5], reduction[0]);
+                    try std.testing.expectEqual(a[4], reduction[1]);
+                    try std.testing.expectEqual(count * w.n, reduction[2]);
+                    try std.testing.expectEqual(@as(u64, 4), reduction[3]);
+                    try std.testing.expect(count * w.n * 4 * 4 <= mm.partBytes(rows, w));
+                    covered += count;
+                }
+                try std.testing.expectEqual(rows, covered);
+            };
+        }
+    }
+}
+
+test "packed single slice keeps its existing short and prompt row policy" {
+    var k = kernels;
+    k.affine_rows = kernels.by_rows;
+    k.fp8_rows = kernels.by_rows;
+    for ([_]mm.Format{ .affine4, .fp8 }) |format| {
+        const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 12288, .k = 4096, .bits = if (format == .affine4) 4 else 8, .format = format };
+        for ([_]usize{ 1, 16, 17, 32, 33, 64, 65, 126, 127, 128, 129, 257, 1862 }) |rows| for ([_]bool{ false, true }) |prompt| for ([_]bool{ false, true }) |batched| {
+            k.packed_prompt_batch = batched;
+            cuda.count = 0;
+            try mm.matmul(&k, .{}, 4096, 4096, w, 65536, 0, rows, false, prompt);
+            try std.testing.expectEqual(@as(usize, 0), mm.partBytes(rows, w));
+            try std.testing.expectEqual(@as(usize, if (rows >= 128) 1 else (rows + 63) / 64), cuda.count);
+            try std.testing.expectEqual(@as(u32, if (rows >= 128) 128 else if (rows <= 16) 16 else if (rows <= 32) 32 else 64), cuda.symbols[0]);
+            for (0..cuda.count) |i| try std.testing.expectEqual(@as(u32, 1), cuda.configs[i].grid.z);
+        };
+    }
+}

@@ -104,7 +104,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+fn b16Shapes(w: *const weights.Weights) [14][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -116,6 +116,8 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
         if (c.exl3) .{ 2 * s.dense.len(), c.hidden } else .{ c.hidden, 2 * c.hidden }, // bf16 dense layers: [gate | up]
         if (c.exl3) .{ c.hidden, s.dense.len() } else .{ c.hidden, 2 * c.hidden }, // and down
+        .{ c.hidden, s.shared.len() }, // shared expert down
+        .{ s.vocab.len(), c.hidden }, // head, including packed prompt-logprob passes at high TP
     };
 }
 
@@ -131,6 +133,33 @@ test "GLM TP3: existing scratch covers raw projections through the 127-row split
             for (shapes[0..2]) |shape| try std.testing.expect(b16.partBytes(rows, shape[0], shape[1]) <= planned);
         }
     }
+}
+
+test "GLM TP1-16: packed split windows and actual head fit native scratch planner" {
+    const mm = @import("cuda_mm.zig");
+    const Share = @import("cuda_shard.zig").Share;
+    try std.testing.expect(mm.packed_split_rows <= b16.rows_from - 1);
+    for ([_]bool{ false, true }) |exl3_format| for (1..17) |world| for (0..world) |rank| {
+        const c: @import("config.zig").Config = .{ .exl3 = exl3_format, .head_unit = if (exl3_format) 128 else 64 };
+        const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, world) };
+        for ([_]usize{ 1, 8, 64, 126, 127, 128, 129, 254, 255, 256, 257, 1862, 2048 }) |rows| {
+            var planned: usize = 4;
+            for (b16Shapes(&w)) |shape| planned = @max(planned, b16.partBytes(@min(rows, b16.rows_from - 1), shape[0], shape[1]));
+            for (b16Shapes(&w)) |shape| for ([_]mm.Format{ .affine4, .fp8 }) |format| {
+                const tiled: mm.Tiled = .{ .w = 0, .n = shape[0], .k = shape[1], .format = format };
+                try std.testing.expect(mm.partBytes(rows, tiled) <= planned);
+            };
+            // Check actual callers independently of the planner's shape list.
+            for ([_][2]usize{ .{ c.hidden, w.share.shared.len() }, .{ w.share.vocab.len(), c.hidden } }) |shape| {
+                const tiled: mm.Tiled = .{ .w = 0, .n = shape[0], .k = shape[1], .bits = 8, .format = .fp8 };
+                try std.testing.expect(mm.partBytes(rows, tiled) <= planned);
+            }
+            if (exl3_format and world == 16 and rank == 0 and rows == 127)
+                try std.testing.expectEqual(@as(usize, 9_883_648), planned);
+            if (world == 2 and rows == 127)
+                try std.testing.expectEqual(@as(usize, 8_323_072), planned);
+        }
+    };
 }
 
 /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.

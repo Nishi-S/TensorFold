@@ -4,7 +4,7 @@ const cuda = @import("cuda");
 const mm = @import("cuda_mm.zig");
 
 pub fn read(s: anytype, get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !void {
-    inline for (.{ .{ "TF_EXL3_DECODE_PREFETCH", "exl3_prefetch" }, .{ "TF_GLM_Q4_PAIR_DECODE", "q4_pair_decode" } }) |e| {
+    inline for (.{ .{ "TF_EXL3_DECODE_PREFETCH", "exl3_prefetch" }, .{ "TF_GLM_Q4_PAIR_DECODE", "q4_pair_decode" }, .{ "TF_GLM_AFFINE_PRUNE", "affine_prune" }, .{ "TF_GLM_PACKED_PROMPT_BATCH", "packed_prompt_batch" } }) |e| {
         if (get(e[0])) |v| {
             if (std.mem.eql(u8, v, "1")) @field(s, e[1]) = true else if (!std.mem.eql(u8, v, "0")) {
                 problem.* = e[0] ++ ": 0 or 1";
@@ -78,7 +78,9 @@ pub fn bits(s: anytype) u32 {
         @as(u32, @intFromBool(s.q4_pair_decode)) << 17 |
         @as(u32, @backingInt(s.dense_format)) << 21 |
         @as(u32, @backingInt(s.head_format)) << 23 |
-        @as(u32, s.exl3_fuse) << 25;
+        @as(u32, s.exl3_fuse) << 25 |
+        @as(u32, @intFromBool(s.affine_prune)) << 27 |
+        @as(u32, @intFromBool(s.packed_prompt_batch)) << 28;
 }
 
 pub const Format = mm.Format;

@@ -4,10 +4,10 @@ const cuda = @import("cuda");
 const glm = @import("glm_cuda");
 const check = @import("check.zig");
 pub const Gpu = check.Gpu;
-const pool = 136;
+const pool = 264;
 const guard = 128;
 const marker = 0xa5;
-const counts = [_]usize{ 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129 };
+const counts = [_]usize{ 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 126, 127, 128, 129, 254, 255, 256, 257 };
 fn bf(v: f32) u16 {
     const u: u32 = @bitCast(v);
     return @truncate((u + 0x7fff + ((u >> 16) & 1)) >> 16);
@@ -147,6 +147,7 @@ pub fn run(gpu: check.Gpu) !void {
     defer module.unload();
     var kernels = try glm.mm.Kernels.load(module);
     try kernels.loadAffine(module);
+    kernels.packed_prompt_batch = true;
     for ([_][2]usize{ .{ 8, 64 }, .{ 72, 512 }, .{ 128, 2048 } }) |dims| try shape(gpu, &kernels, s, 4, dims[0], dims[1], false);
     try shape(gpu, &kernels, s, 4, 72, 2048, true);
     check.pass("glm-affine: unsigned Q4/BF16 tables, FP32/bf16 output, prompt/decode, stride/offset/bucket/tail cells against FP64 plus random row/prompt invariance", .{});

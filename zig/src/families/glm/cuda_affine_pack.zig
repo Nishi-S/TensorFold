@@ -23,6 +23,10 @@ fn code(v: f32, scale: f32, bias: f32) u32 {
 const Candidate = struct { scale: u16, bias: u16, loss: f32 };
 
 fn candidate(group: *const [64]f32, lo: f32, hi: f32, i: usize) !Candidate {
+    return candidateUntil(group, lo, hi, i, std.math.inf(f32));
+}
+
+fn candidateUntil(group: *const [64]f32, lo: f32, hi: f32, i: usize, cutoff: f32) !Candidate {
     const alpha: f32 = @floatCast(1.0 - 0.45 * @as(f64, @floatFromInt(i)) / 15.0);
     const low = lo * alpha;
     const high = hi * alpha;
@@ -37,6 +41,7 @@ fn candidate(group: *const [64]f32, lo: f32, hi: f32, i: usize) !Candidate {
         const product = q * scale;
         const residual = product + bias - v;
         loss += residual * residual;
+        if (cutoff != std.math.inf(f32) and loss >= cutoff) return .{ .scale = s, .bias = b, .loss = loss };
     }
     if (!std.math.isFinite(loss)) return error.AffineRangeOverflow;
     return .{ .scale = s, .bias = b, .loss = loss };
@@ -44,6 +49,22 @@ fn candidate(group: *const [64]f32, lo: f32, hi: f32, i: usize) !Candidate {
 
 /// Row-major BF16 [n,k] to low-first nibbles and BF16 [n,k/64] metadata; deterministic scalar-FP32 MSE scoring.
 pub fn quantize(src: []const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) !void {
+    return quantizeImpl(false, src, n, k, words, scales, biases);
+}
+
+/// Identical output and errors; skip losing candidates once their bounded nonnegative loss prefix cannot win.
+pub fn quantizePruned(src: []const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) !void {
+    return quantizeImpl(true, src, n, k, words, scales, biases);
+}
+
+pub fn pruningEnabled(value_: ?[]const u8) !bool {
+    const v = value_ orelse return false;
+    if (std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.BadAffinePruneSetting;
+}
+
+fn quantizeImpl(comptime prune: bool, src: []const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) !void {
     @setFloatMode(.strict);
     if (n == 0 or k == 0 or k % 64 != 0) return error.BadAffineShape;
     const elements = std.math.mul(usize, n, k) catch return error.BadAffineShape;
@@ -61,7 +82,9 @@ pub fn quantize(src: []const u16, n: usize, k: usize, words: []u32, scales: []u1
         }
         var best = try candidate(&group, lo, hi, 0);
         for (1..16) |i| {
-            const trial = try candidate(&group, lo, hi, i);
+            // At |v| <= 1e10, residuals stay below 1e12 and 64 squares fit f32; losing prefixes cannot win.
+            const cutoff = if (prune and @max(@abs(lo), @abs(hi)) <= 1e10) best.loss else std.math.inf(f32);
+            const trial = try candidateUntil(&group, lo, hi, i, cutoff);
             if (trial.loss < best.loss) best = trial;
         }
         scales[g] = best.scale;
@@ -130,4 +153,65 @@ test "ties round to even and unsupported geometry or weights are refused" {
         src[0] = h;
         try std.testing.expectError(error.NonfiniteAffineWeight, quantize(&src, 1, 64, &words, &scales, &biases));
     }
+}
+
+test "optimized affine packing is byte-identical to the scalar floor-mod reference" {
+    const reference = @import("cuda_affine_pack_reference_test.zig");
+    var prng = std.Random.DefaultPrng.init(0xa441_2026);
+    const random = prng.random();
+    var src: [64 * 127]u16 = undefined;
+    for (&src) |*v| v.* = bf16((random.float(f32) * 2 - 1) * 37);
+    for (0..4) |g| @memset(src[g * 64 ..][0..64], bf16(@as(f32, @floatFromInt(g)) - 2));
+    src[4 * 64] = bf16(512);
+    src[4 * 64 + 1] = bf16(-512);
+    var words: [src.len / 8]u32 = undefined;
+    var expected_words: [src.len / 8]u32 = undefined;
+    var scales: [src.len / 64]u16 = undefined;
+    var expected_scales: [src.len / 64]u16 = undefined;
+    var biases: [src.len / 64]u16 = undefined;
+    var expected_biases: [src.len / 64]u16 = undefined;
+    try quantizePruned(&src, 127, 64, &words, &scales, &biases);
+    try reference.quantize(&src, 127, 64, &expected_words, &expected_scales, &expected_biases);
+    try std.testing.expectEqualSlices(u32, &expected_words, &words);
+    try std.testing.expectEqualSlices(u16, &expected_scales, &scales);
+    try std.testing.expectEqualSlices(u16, &expected_biases, &biases);
+}
+
+test "candidate pruning preserves overflow errors and unpruned huge finite groups" {
+    const reference = @import("cuda_affine_pack_reference_test.zig");
+    var src: [64]u16 = undefined;
+    var words: [8]u32 = undefined;
+    var scales: [1]u16 = undefined;
+    var biases: [1]u16 = undefined;
+    var rw: [8]u32 = undefined;
+    var rs: [1]u16 = undefined;
+    var rb: [1]u16 = undefined;
+    for ([_]f32{ 1e8, 3.125e8, 3.15e8, 1e10, 1e11, 1e15 }) |magnitude| {
+        for (&src, 0..) |*v, i| v.* = bf16(magnitude * (@as(f32, @floatFromInt(i)) - 31));
+        try quantizePruned(&src, 1, 64, &words, &scales, &biases);
+        try reference.quantize(&src, 1, 64, &rw, &rs, &rb);
+        try std.testing.expectEqualSlices(u32, &rw, &words);
+        try std.testing.expectEqualSlices(u16, &rs, &scales);
+        try std.testing.expectEqualSlices(u16, &rb, &biases);
+    }
+    const edge = bf16(1e10);
+    for ([_]u16{ edge - 1, edge, edge + 1 }) |h| {
+        for (&src, 0..) |*v, i| v.* = bf16(value(h) * ((@as(f32, @floatFromInt(i)) - 31) / 32));
+        try quantizePruned(&src, 1, 64, &words, &scales, &biases);
+        try reference.quantize(&src, 1, 64, &rw, &rs, &rb);
+        try std.testing.expectEqualSlices(u32, &rw, &words);
+        try std.testing.expectEqualSlices(u16, &rs, &scales);
+        try std.testing.expectEqualSlices(u16, &rb, &biases);
+    }
+    for (&src, 0..) |*v, i| v.* = bf16(1e30 * (@as(f32, @floatFromInt(i)) - 31));
+    try std.testing.expectError(error.AffineRangeOverflow, reference.quantize(&src, 1, 64, &rw, &rs, &rb));
+    try std.testing.expectError(error.AffineRangeOverflow, quantizePruned(&src, 1, 64, &words, &scales, &biases));
+}
+
+test "affine candidate pruning is explicit and rejects misspelled settings" {
+    try std.testing.expect(!try pruningEnabled(null));
+    try std.testing.expect(!try pruningEnabled("0"));
+    try std.testing.expect(try pruningEnabled("1"));
+    for ([_][]const u8{ "", "true", "01", "2" }) |v|
+        try std.testing.expectError(error.BadAffinePruneSetting, pruningEnabled(v));
 }

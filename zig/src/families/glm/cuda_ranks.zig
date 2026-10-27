@@ -23,6 +23,8 @@ pub const Settings = struct {
     exl3_prefetch: bool = false, // TF_EXL3_DECODE_PREFETCH: opt-in mcg four-bit load scheduling
     q4_pair_decode: bool = false, // TF_GLM_Q4_PAIR_DECODE: opt-in packed Q4 conversion
 
+    affine_prune: bool = false,
+    packed_prompt_batch: bool = false,
     dense_format: mia.Format = .symmetric,
     head_format: mia.Format = .symmetric,
     exl3_loads: u3 = 0,
@@ -334,7 +336,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_images => "the image count limit",
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
-        .bits => "dense/head quantization formats or EXL3/Q4 decode settings",
+        .bits => "dense/head formats, packing/prompt experiments or EXL3/Q4 decode settings",
         .prefetch => "TF_GLM_L2PF, TF_GLM_L2PF_MB or TF_GLM_L2PF_ROWS",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
