@@ -184,3 +184,40 @@ test "packing and prompt scheduling experiments use independent rank bits" {
     try std.testing.expectEqual(@as(u32, 16 << 8 | 16), a.bits & 0x07ffffff);
     try std.testing.expectEqual(@as(u32, 16 << 8 | 16), b.bits & 0x07ffffff);
 }
+
+test "prompt K experiment: execution routes default off reject typos and agree on every rank" {
+    const mia = @import("cuda_mia_settings.zig");
+    var problem: []const u8 = "";
+    defer MiaEnv.pairs = &.{};
+    const base = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0));
+    try std.testing.expectEqual(@as(u32, 0), base.execution);
+    var combined: u32 = 0;
+    inline for (mia.execution_flags, 0..) |entry, i| {
+        for ([_][]const u8{ "", "true", "2", "01" }) |bad| {
+            MiaEnv.pairs = &.{.{ entry[0], bad }};
+            try std.testing.expectError(error.BadSetting, Settings.read(MiaEnv.get, &problem));
+            try std.testing.expectEqualStrings(entry[0] ++ ": 0 or 1", problem);
+        }
+        MiaEnv.pairs = &.{.{ entry[0], "0" }};
+        try std.testing.expect(!@field((try Settings.read(MiaEnv.get, &problem)).execution, entry[1]));
+        MiaEnv.pairs = &.{.{ entry[0], "1" }};
+        const selected = try Settings.read(MiaEnv.get, &problem);
+        const other = Fingerprint.of(2, 1, selected, 8192, true, @splat(0), @splat(0), @splat(0));
+        try std.testing.expectEqual(@as(u32, 1) << i, other.execution);
+        try std.testing.expectEqual(@as(u32, 0), combined & other.execution);
+        combined |= other.execution;
+        var peers = [_]Fingerprint{ base, other };
+        try std.testing.expectEqual(Fingerprint.Field.execution, mismatch(&peers).?.field);
+        peers[0].execution = other.execution;
+        try std.testing.expect(mismatch(&peers) == null);
+    }
+}
+
+test "prompt K experiment: graph profiling cannot diverge rank capture decisions" {
+    defer MiaEnv.pairs = &.{};
+    var problem: []const u8 = "";
+    MiaEnv.pairs = &.{ .{ "TF_GLM_DECODE_GRAPHS", "1" }, .{ "TF_GLM_PROF", "1" } };
+    try std.testing.expectError(error.BadSetting, Settings.read(MiaEnv.get, &problem));
+    MiaEnv.pairs = &.{ .{ "TF_GLM_DECODE_GRAPHS", "1" }, .{ "TF_GLM_PROF", "0" } };
+    try std.testing.expect((try Settings.read(MiaEnv.get, &problem)).execution.decode_graphs);
+}

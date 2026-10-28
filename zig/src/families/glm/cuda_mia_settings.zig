@@ -3,7 +3,43 @@ const std = @import("std");
 const cuda = @import("cuda");
 const mm = @import("cuda_mm.zig");
 
+pub const Execution = struct {
+    affine_gpu: bool = false,
+    affine_xs: bool = false,
+    affine_shapes: bool = false,
+    affine_prefill: bool = false,
+    moe_direct: bool = false,
+    decode_graphs: bool = false,
+    hc_mma: bool = false,
+    hc_decode: bool = false,
+    kda_wy: bool = false,
+};
+
+pub const execution_flags = .{
+    .{ "TF_GLM_AFFINE_GPU", "affine_gpu" },
+    .{ "TF_GLM_AFFINE_XS", "affine_xs" },
+    .{ "TF_GLM_AFFINE_SHAPES", "affine_shapes" },
+    .{ "TF_GLM_AFFINE_PREFILL", "affine_prefill" },
+    .{ "TF_GLM_MOE_DIRECT", "moe_direct" },
+    .{ "TF_GLM_DECODE_GRAPHS", "decode_graphs" },
+    .{ "TF_GLM_HC_MMA", "hc_mma" },
+    .{ "TF_GLM_HC_DEC", "hc_decode" },
+    .{ "TF_GLM_KDA_WY", "kda_wy" },
+};
+
+pub fn executionBits(e: Execution) u32 {
+    var out: u32 = 0;
+    inline for (execution_flags, 0..) |entry, i| out |= @as(u32, @intFromBool(@field(e, entry[1]))) << i;
+    return out;
+}
+
 pub fn read(s: anytype, get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !void {
+    inline for (execution_flags) |entry| if (get(entry[0])) |value| {
+        if (std.mem.eql(u8, value, "1")) @field(s.execution, entry[1]) = true else if (!std.mem.eql(u8, value, "0")) {
+            problem.* = entry[0] ++ ": 0 or 1";
+            return error.BadSetting;
+        }
+    };
     inline for (.{ .{ "TF_EXL3_DECODE_PREFETCH", "exl3_prefetch" }, .{ "TF_GLM_Q4_PAIR_DECODE", "q4_pair_decode" }, .{ "TF_GLM_AFFINE_PRUNE", "affine_prune" }, .{ "TF_GLM_PACKED_PROMPT_BATCH", "packed_prompt_batch" } }) |e| {
         if (get(e[0])) |v| {
             if (std.mem.eql(u8, v, "1")) @field(s, e[1]) = true else if (!std.mem.eql(u8, v, "0")) {
@@ -11,6 +47,12 @@ pub fn read(s: anytype, get: *const fn ([:0]const u8) ?[]const u8, problem: *[]c
                 return error.BadSetting;
             }
         }
+    }
+    if (s.execution.decode_graphs) {
+        if (get("TF_GLM_PROF")) |v| if (std.mem.eql(u8, v, "1")) {
+            problem.* = "TF_GLM_DECODE_GRAPHS and TF_GLM_PROF cannot be enabled together";
+            return error.BadSetting;
+        };
     }
     const mode = cuda.exl3_experts.prefetch.resolve(get("TF_EXL3_DECODE_LOADS"), get("TF_EXL3_DECODE_PREFETCH")) catch {
         problem.* = "TF_EXL3_DECODE_LOADS: baseline, scalar, nc1, nc2 or nc4";

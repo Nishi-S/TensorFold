@@ -37,6 +37,7 @@ const glm_vision_tests = @import("glm_vision_tests.zig");
 const glm_mm_fixed = @import("glm_mm_fixed_tests.zig");
 const glm_q4_pair = @import("glm_q4_pair_tests.zig");
 const glm_fp8 = @import("glm_fp8_tests.zig");
+const glm_affine_quant = @import("glm_affine_quant_tests.zig");
 const glm_affine = @import("glm_affine_tests.zig");
 const glm_mm_bench = @import("glm_mm_bench.zig");
 const carveout_tests = @import("carveout_tests.zig");
@@ -234,6 +235,7 @@ const usage =
     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
     \\  glm-q4-pair               Experimental Q4 pair decoding against original bytes and FP64
     \\  glm-fp8                   Weight-only FP8 products against exact FP64 with stride and row-bucket checks
+    \\  glm-affine-quant          GPU startup affine packing versus scalar bytes
     \\  glm-affine                Affine Q4 BF16 scale/bias tiling and execution against FP64
     \\  glm-mm-bench              GLM's bf16 linears: b16.matmul against glm_mm, by rows (one GPU)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
@@ -374,6 +376,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return glm_mm_fixed.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-q4-pair")) return glm_q4_pair.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-fp8")) return glm_fp8.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-affine-quant")) return glm_affine_quant.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-affine")) return glm_affine.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));

@@ -23,6 +23,7 @@ pub const Settings = struct {
     exl3_prefetch: bool = false, // TF_EXL3_DECODE_PREFETCH: opt-in mcg four-bit load scheduling
     q4_pair_decode: bool = false, // TF_GLM_Q4_PAIR_DECODE: opt-in packed Q4 conversion
 
+    execution: mia.Execution = .{},
     affine_prune: bool = false,
     packed_prompt_batch: bool = false,
     dense_format: mia.Format = .symmetric,
@@ -115,7 +116,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 13, // this struct's version
+    layout: u32 = 14, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -134,6 +135,7 @@ pub const Fingerprint = extern struct {
     max_frames: u32 = 0,
     bits: u32 = 16 << 8 | 16, // dense/head bits plus normalized format, load and fusion selections
     prefetch: u32 = 64 << 9 | 8 << 2, // bounded L2 prefetch: rows, MiB and mode
+    execution: u32 = 0,
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -161,6 +163,7 @@ pub const Fingerprint = extern struct {
         max_frames,
         bits,
         prefetch,
+        execution,
         capacity,
         heat_high,
         heat_low,
@@ -193,6 +196,7 @@ pub const Fingerprint = extern struct {
             .mtp = @intFromBool(mtp),
             .bits = mia.bits(s),
             .prefetch = mia.l2Fingerprint(s),
+            .execution = mia.executionBits(s.execution),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -229,6 +233,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_frames",
             "bits",
             "prefetch",
+            "execution",
             "capacity",
             "heat_high",
             "heat_low",
@@ -336,6 +341,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_images => "the image count limit",
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
+        .execution => "GLM execution experiments",
         .bits => "dense/head formats, packing/prompt experiments or EXL3/Q4 decode settings",
         .prefetch => "TF_GLM_L2PF, TF_GLM_L2PF_MB or TF_GLM_L2PF_ROWS",
         .capacity => "the sequence capacity (the context)",

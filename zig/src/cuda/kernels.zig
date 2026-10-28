@@ -70,6 +70,7 @@ pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes e
 pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
 pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
 pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
+pub const glm_affine_quant: []const u8 = if (available) &Blob("fatbin_glm_affine_quant").bytes else &.{};
 pub const glm_l2_prefetch: []const u8 = if (available) &Blob("fatbin_glm_l2_prefetch").bytes else &.{};
 pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
 pub const glm_dflash: []const u8 = if (available) &Blob("fatbin_glm_dflash").bytes else &.{};

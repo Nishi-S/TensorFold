@@ -147,6 +147,30 @@ pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: 
     if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
     return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
 }
+/// Scratch for one whole prompt; the compact pick/output arrays are owned by the GLM MoE buffers.
+pub fn scratchBytesDirect(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
+    var l = shape(dims, width);
+    l.shared_input = shx;
+    if (prefill and common.prompt.eligible(l)) return .{ common.prompt.bytes(l, rows, top_k) catch unreachable, 4, 4, 4 };
+    return .{ common.scratchBytes(l, rows, top_k) catch unreachable, 4, 4, 4 };
+}
+
+/// Compact routed picks and outputs avoid 9-to-8-to-9 copies; eligible prompts run as one expert pass.
+pub fn runDirect(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64) !void {
+    if (rows == 0 or dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
+    const l = layer(w, count, dims, width, limit);
+    if (prompt and common.prompt.eligible(l)) {
+        var scratch = try common.prompt.scratch(sc.picks, l, rows, top_k);
+        scratch.y = ey;
+        try k.prompt.run(k, ek.router, stream, l, x, x_stride, picks, rows, scratch, plan_buf);
+    } else {
+        if (rows * top_k * 4 > 64 * 1024) return error.Exl3DecodeWindowTooWide;
+        var scratch = try common.scratch(sc.picks, l, rows, top_k);
+        scratch.y = ey;
+        try k.runSlots(stream, l, x, x_stride, .bf16, picks, rows, scratch);
+    }
+}
+
 /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
 fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
@@ -203,4 +227,16 @@ test "a chunk's compacted picks end before the common scratch at every row count
 
 test "GLM's routed experts run on the common EXL3 module's kernels" {
     try std.testing.expect(Kernels == cuda.exl3_experts.Experts);
+}
+
+test "direct EXL3 prompt scratch covers the whole 1862-row window" {
+    for ([_]bool{ false, true }) |shared| {
+        const bytes = scratchBytesDirect(1862, 4096, 1024, true, shared);
+        var l = shape(4096, 1024);
+        l.shared_input = shared;
+        const sc = try common.prompt.scratch(256, l, 1862, top_k);
+        try std.testing.expectEqual(@as(usize, 1862), sc.rows);
+        try std.testing.expect(sc.y + 1862 * top_k * 4096 * 4 <= 256 + bytes[0]);
+        try std.testing.expect(bytes[0] > scratchBytes(1862, 4096, 1024, true, shared)[0]);
+    }
 }

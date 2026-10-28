@@ -83,6 +83,7 @@ const Fixture = struct {
         f.e.seqs = .empty;
         f.e.images = null;
         f.e.pages = null;
+        f.e.graphs = .{};
         f.e.w = undefined;
         f.e.w.config = .{ .layers = 2, .kv_lora = 16, .i_dim = 8, .hidden = 64 };
         f.e.w.share = try glm.shard.Share.of(&f.e.w.config, 0, 2);
@@ -298,6 +299,7 @@ test "GLM pages: a refused image activation frees a new window and restores the 
     try t.expect(f.e.seqs.items[3] == null);
     try t.expectEqual(f.e.seqs.items[1].?, f.e.cur);
     try t.expectEqual(@as(u32, 1), f.e.slot);
+    try t.expect(f.e.graphs.cache == null);
 }
 
 const Open = struct {

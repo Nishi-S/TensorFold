@@ -7,7 +7,7 @@ const qpack = @import("cuda_qpack.zig");
 const affine_pack = @import("cuda_affine_pack.zig");
 const fp8_pack = @import("cuda_fp8_pack.zig");
 const pack_timing = @import("cuda_pack_timing.zig");
-pub const Formats = struct { dense: mm_mod.Format = .symmetric, head: mm_mod.Format = .symmetric, affine_prune: bool = false };
+pub const Formats = struct { dense: mm_mod.Format = .symmetric, head: mm_mod.Format = .symmetric, affine_prune: bool = false, affine_gpu: bool = false };
 const projection = @import("cuda_proj.zig");
 const Weights = weights.Weights;
 const Layer = weights.Layer;
@@ -128,6 +128,9 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
     errdefer packed_ptrs.deinit(gpa);
     var packed_bits: std.ArrayList(u8) = .empty;
     errdefer packed_bits.deinit(gpa);
+    var gpu_quant: ?@import("cuda_affine_quant.zig").Quantizer = if (formats.affine_gpu) try @import("cuda_affine_quant.zig").Quantizer.init(d) else null;
+    defer if (gpu_quant) |*q| q.deinit();
+    errdefer @import("cuda_load_owner.zig").drain(s, d);
     var freed: usize = 0;
     timing.mark(.setup);
     for (list.items, 0..) |e, i| {
@@ -146,36 +149,42 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
             }
             continue;
         }
-        try host.resize(gpa, n * k);
-        try s.synchronize();
-        try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
-        timing.mark(.readback);
         const sizes = mm_mod.formatBytes(n, k, bits, format);
-        switch (format) {
-            .symmetric, .affine4 => {
-                try words.resize(gpa, n * k * bits / 32);
-                try scales.resize(gpa, n * (k / 64));
-                if (format == .affine4) {
-                    try biases.resize(gpa, scales.items.len);
-                    if (formats.affine_prune) try affine_pack.quantizePruned(host.items, n, k, words.items, scales.items, biases.items) else try affine_pack.quantize(host.items, n, k, words.items, scales.items, biases.items);
-                } else qpack.quantize(bits, host.items, n, k, words.items, scales.items);
-                timing.mark(if (format == .affine4) .affine_quant else .symmetric_quant);
-                try tmp.upload(0, std.mem.sliceAsBytes(words.items));
-                try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
-                if (format == .affine4) {
-                    try tmp.upload(sizes[0] + sizes[1], std.mem.sliceAsBytes(biases.items));
-                    try mm_mod.tileAffine(mk, s, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
-                } else try mm_mod.tilePacked(mk, s, bits, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
-            },
-            .fp8 => {
-                try codes8.resize(gpa, n * k);
-                try scales8.resize(gpa, n * (k / 128));
-                try fp8_pack.quantize(host.items, n, k, codes8.items, scales8.items);
-                timing.mark(.fp8_quant);
-                try tmp.upload(0, codes8.items);
-                try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales8.items));
-                try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, sizes[0] + sizes[1], s.handle), "cuMemcpyDtoDAsync");
-            },
+        if (format == .affine4 and gpu_quant != null) {
+            try gpu_quant.?.run(s, ptr, tmp.ptr, n, k);
+            timing.mark(.affine_quant);
+            try mm_mod.tileAffine(mk, s, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+        } else {
+            try host.resize(gpa, n * k);
+            try s.synchronize();
+            try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
+            timing.mark(.readback);
+            switch (format) {
+                .symmetric, .affine4 => {
+                    try words.resize(gpa, n * k * bits / 32);
+                    try scales.resize(gpa, n * (k / 64));
+                    if (format == .affine4) {
+                        try biases.resize(gpa, scales.items.len);
+                        if (formats.affine_prune) try affine_pack.quantizePruned(host.items, n, k, words.items, scales.items, biases.items) else try affine_pack.quantize(host.items, n, k, words.items, scales.items, biases.items);
+                    } else qpack.quantize(bits, host.items, n, k, words.items, scales.items);
+                    timing.mark(if (format == .affine4) .affine_quant else .symmetric_quant);
+                    try tmp.upload(0, std.mem.sliceAsBytes(words.items));
+                    try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
+                    if (format == .affine4) {
+                        try tmp.upload(sizes[0] + sizes[1], std.mem.sliceAsBytes(biases.items));
+                        try mm_mod.tileAffine(mk, s, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+                    } else try mm_mod.tilePacked(mk, s, bits, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+                },
+                .fp8 => {
+                    try codes8.resize(gpa, n * k);
+                    try scales8.resize(gpa, n * (k / 128));
+                    try fp8_pack.quantize(host.items, n, k, codes8.items, scales8.items);
+                    timing.mark(.fp8_quant);
+                    try tmp.upload(0, codes8.items);
+                    try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales8.items));
+                    try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, sizes[0] + sizes[1], s.handle), "cuMemcpyDtoDAsync");
+                },
+            }
         }
         try s.synchronize(); // tmp is the next linear's
         timing.mark(.upload_tile);

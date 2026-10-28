@@ -10,8 +10,12 @@ pub const Proj = union(enum) { bf16: u64, fp8g: cuda.qmmf.Weight, mxfp8: cuda.qm
 
 /// x [m][k] (rows `x_stride` apart) by `w` into out [m][n]: bf16, or fp32 with `wide`; `part` the bf16 path's slices.
 pub fn matmul(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    return matmulXs(set, stream, w, x, x_stride, out, part, m, n, k, wide, 0);
+}
+
+pub fn matmulXs(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool, xs: u64) !void {
     switch (w) {
-        .bf16 => |p| return b16.matmul(set, stream, x, x_stride, p, out, part, m, n, k, wide),
+        .bf16 => |p| return b16.matmulXs(set, stream, x, x_stride, p, out, part, m, n, k, wide, xs),
         .fp8g, .mxfp8 => |q| {
             if (q.n != n or q.k != k) return error.ShapeMismatch;
             const lane = set.linear.lane orelse return error.FormatNotLoaded;

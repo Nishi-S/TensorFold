@@ -5,7 +5,7 @@ const cuda = @import("cuda");
 const mm_mod = @import("cuda_mm.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, affine_xs_scratch: u64 = 0, affine_input: @import("cuda_affine_input.zig").Input = .{} };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -21,6 +21,7 @@ pub const Kernels = struct {
     rank_sum: cuda.Function,
     hc_post: cuda.Function,
     combine: cuda.Function,
+    combine_shared: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
     put_words: cuda.Function,
@@ -30,10 +31,15 @@ pub const Kernels = struct {
     swiglu_64: cuda.Function,
     group_sums: cuda.Function,
     topk: cuda.Function,
+    topk_routed: cuda.Function,
     router_part: cuda.Function,
     router_tile: cuda.Function,
     hc_partial: cuda.Function,
     hc_partial8: cuda.Function,
+    hc_partial_dec: cuda.Function,
+    hc_partial_mma: cuda.Function,
+    hc_decode: bool = false,
+    hc_mma: bool = false,
     hc_finish: cuda.Function,
     hc_finish_f32w: cuda.Function,
     absorb_q: cuda.Function,
@@ -60,7 +66,9 @@ pub const Kernels = struct {
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
+        inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
+            if (@TypeOf(@field(k, name)) == cuda.Function) @field(k, name) = try m.function("tf_glm_" ++ name) else @field(k, name) = false;
+        }
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -179,6 +187,21 @@ pub fn select(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: u64, 
     try cuda.launch.launch(set.glue.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
 }
 
+/// Select only routed picks into compact rows, retaining top_k+1 weights including the shared weight.
+pub fn selectRouted(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, top_k: usize, experts: usize, scale: f32, norm: bool) !void {
+    if (experts > 512 or top_k >= 32) return error.TopkTooWide;
+    var a: cuda.Args = .{};
+    inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)) }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.topk_routed, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
+}
+
+/// Same ordered slot reduction, reading routed and shared outputs directly without an intermediate copy.
+pub fn combineShared(set: Set, stream: cuda.Stream, routed: u64, shared: u64, wts: u64, out: u64, rows: usize, d: usize, top_k: usize) !void {
+    var a: cuda.Args = .{};
+    inline for (.{ routed, shared, wts, out, i64of(d), cint(top_k) }) |v| a.add(v);
+    try rows8Launch(set.glue.combine_shared, stream, &a, rows, d, .{ routed, shared, out });
+}
+
 /// glue.combine: out [rows][d] fp32 = sum over slots in order of wts[r][k] y[r][k] (y fp32 in decode, bf16 in prefill).
 pub fn combine(set: Set, stream: cuda.Stream, y: u64, y_f32: bool, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
     var a: cuda.Args = .{};
@@ -200,7 +223,13 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     var a: cuda.Args = .{};
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
     // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
-    if (rows < 64) {
+    if (set.prompt and set.glue.hc_mma) {
+        a.add(i64of(rows));
+        try cuda.launch.launch(set.glue.hc_partial_mma, .{ .grid = .{ .x = cdiv(rows, 64), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
+    } else if (!set.prompt and set.glue.hc_decode) {
+        a.add(i64of(rows));
+        try cuda.launch.launch(set.glue.hc_partial_dec, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks, .z = 3 }, .block = .{ .x = 288 } }, stream, &a);
+    } else if (rows < 64) {
         try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
     } else {
         a.add(i64of(rows));

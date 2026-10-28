@@ -226,3 +226,25 @@ struct tf_glm_words {
 extern "C" __global__ void tf_glm_put_words(unsigned* dst, unsigned n, tf_glm_words v) {
   for (unsigned i = threadIdx.x; i < n; i += blockDim.x) dst[i] = v.w[i];
 }
+
+// Packed routed slots followed by the separate shared output, in the original nine-slot FMA order.
+extern "C" __global__ void __launch_bounds__(128) tf_glm_combine_shared(
+    const float* routed, const float* shared, const float* wts, float* out, int64_t d, int top_k) {
+  const int64_t c = glm_glue::col8();
+  if (c >= d) return;
+  const int64_t r = blockIdx.x;
+  float a[8] = {};
+  for (int k = 0; k < top_k; ++k) {
+    float v[8];
+    glm_glue::ld8(routed + (r * top_k + k) * d + c, v);
+    const float w = wts[r * (top_k + 1) + k];
+    for (int j = 0; j < 8; ++j) a[j] = __fmaf_rn(v[j], w, a[j]);
+  }
+  float v[8];
+  glm_glue::ld8(shared + r * d + c, v);
+  const float w = wts[r * (top_k + 1) + top_k];
+  for (int j = 0; j < 8; ++j) a[j] = __fmaf_rn(v[j], w, a[j]);
+  float* o = out + r * d + c;
+  *reinterpret_cast<float4*>(o) = make_float4(a[0], a[1], a[2], a[3]);
+  *reinterpret_cast<float4*>(o + 4) = make_float4(a[4], a[5], a[6], a[7]);
+}

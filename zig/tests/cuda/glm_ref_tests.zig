@@ -196,6 +196,7 @@ pub fn run(gpu: Gpu) !void {
     const set: glue.Set = .{ .glue = &ks };
     for ([_]Shape{ .{ .n = 512, .k = 4096 }, .{ .n = 1280, .k = 1536 }, .{ .n = 1024, .k = 128 } }) |sh| try matmuls(&r, set, sh);
     try routers(&r, set);
+    try @import("glm_moe_direct_tests.zig").run(&r, set);
     try @import("glm_ref_attn.zig").dense(&r, set);
     try @import("glm_ref_attn.zig").sparse(&r, set);
     try @import("glm_ref_fp8.zig").run(&r, set);

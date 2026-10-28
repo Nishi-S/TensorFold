@@ -101,8 +101,10 @@ fn shape(gpu: check.Gpu, modules: *const glm.mm.Kernels, s: cuda.Stream, bits: u
     var x = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(hx));
     defer x.free();
     const tw: glm.mm.Tiled = .{ .w = tiled.ptr, .s = if (bits == 16) 0 else tiled_scales.ptr, .bits = bits, .n = n, .k = k, .format = .affine4 };
-    var part = try cuda.DeviceBuffer.alloc(gpu.d, @max(16, glm.mm.partBytes(pool, tw)));
+    var part = try cuda.DeviceBuffer.alloc(gpu.d, @max(16, glm.mm.planPartBytes(pool, tw)));
     defer part.free();
+    var xs = try cuda.DeviceBuffer.alloc(gpu.d, pool * (k / 64) * 4);
+    defer xs.free();
     var out = try cuda.DeviceBuffer.alloc(gpu.d, 2 * guard + pool * n * 4);
     defer out.free();
     var solo = try cuda.DeviceBuffer.alloc(gpu.d, out.len);
@@ -136,6 +138,31 @@ fn shape(gpu: check.Gpu, modules: *const glm.mm.Kernels, s: cuda.Stream, bits: u
                 try guards(got, bytes);
                 if (!random) try check.sameBytes("glm-affine: batched against FP64", got[guard..][0..bytes], want[at..][0..bytes]);
                 try check.sameBytes("glm-affine: batched against each row alone", got[guard..][0..bytes], alone[guard + at ..][0..bytes]);
+                var cached = mk;
+                cached.affine_xs = true;
+                for (0..(if (rows == 17 and offset == 1) @as(usize, 5) else 1)) |_| {
+                    try out.fill8(marker, s.handle);
+                    try glm.mm.matmulXs(&cached, s, x.ptr + offset * stride * 2, stride, tw, out.ptr + guard, part.ptr, rows, wide, prompt, 0, xs.ptr);
+                    try s.synchronize();
+                    try out.download(0, got);
+                    try guards(got, bytes);
+                    try check.sameBytes("glm-affine: cached sums against legacy", got[guard..][0..bytes], alone[guard + at ..][0..bytes]);
+                }
+                try out.fill8(marker, s.handle);
+                try glm.mm.matmulXs(&cached, s, x.ptr + offset * stride * 2, stride, tw, out.ptr + guard, part.ptr, rows, wide, prompt, xs.ptr, 0);
+                try s.synchronize();
+                try out.download(0, got);
+                try guards(got, bytes);
+                try check.sameBytes("glm-affine: supplied sums against legacy", got[guard..][0..bytes], alone[guard + at ..][0..bytes]);
+                if (!random) {
+                    cached.affine_prefill = true;
+                    try out.fill8(marker, s.handle);
+                    try glm.mm.matmulXs(&cached, s, x.ptr + offset * stride * 2, stride, tw, out.ptr + guard, part.ptr, rows, wide, true, 0, 0);
+                    try s.synchronize();
+                    try out.download(0, got);
+                    try guards(got, bytes);
+                    try check.sameBytes("glm-affine: reconstructed prompt against FP64", got[guard..][0..bytes], want[at..][0..bytes]);
+                }
             };
         }
     }

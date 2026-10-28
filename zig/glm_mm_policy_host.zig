@@ -148,3 +148,69 @@ test "packed single slice keeps its existing short and prompt row policy" {
         };
     }
 }
+
+test "affine XS reuse avoids reduction and fallback computes each row group once" {
+    var k = kernels;
+    k.affine_rows = kernels.by_rows;
+    k.affine_xs_rows = @splat(.{ .id = 3000 });
+    k.affine_sums = .{ .id = 3001 };
+    k.affine_xs = true;
+    const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 4096, .k = 4096, .bits = 4, .format = .affine4 };
+    cuda.count = 0;
+    try mm.matmulXs(&k, .{}, 4096, 4096, w, 65536, 131072, 65, false, false, 262144, 0);
+    try std.testing.expectEqual(@as(usize, 4), cuda.count);
+    try std.testing.expectEqual(@as(u32, 3000), cuda.symbols[0]);
+    try std.testing.expectEqual(@as(u64, 262144), cuda.args[0].values[11]);
+    try std.testing.expectEqual(@as(u64, 262144 + 64 * 64 * 4), cuda.args[2].values[11]);
+    cuda.count = 0;
+    try mm.matmulXs(&k, .{}, 4096, 4096, w, 65536, 131072, 65, false, false, 0, 262144);
+    try std.testing.expectEqual(@as(usize, 5), cuda.count);
+    try std.testing.expectEqual(@as(u32, 3001), cuda.symbols[0]);
+    try std.testing.expectEqual(@as(u32, 65), cuda.configs[0].grid.x);
+    cuda.count = 0;
+    try std.testing.expectError(error.AffineSumsScratchMissing, mm.matmulXs(&k, .{}, 4096, 4096, w, 65536, 131072, 1, false, false, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), cuda.count);
+}
+
+test "affine shape policy and reconstructed prompt are separate opt ins" {
+    var k = kernels;
+    k.affine_rows = kernels.by_rows;
+    k.affine_xs_rows = kernels.by_rows;
+    k.affine_wide = .{ .id = 5000 };
+    k.affine_prompt = .{ .{ .id = 6064 }, .{ .id = 6128 } };
+    const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 4096, .k = 1024, .bits = 4, .format = .affine4 };
+    k.affine_shapes = true;
+    cuda.count = 0;
+    try mm.matmulXs(&k, .{}, 4096, 1024, w, 65536, 131072, 1, true, false, 262144, 0);
+    try std.testing.expectEqual(@as(u32, 5000), cuda.symbols[0]);
+    try std.testing.expectEqual(@as(u32, 32), cuda.configs[0].grid.x);
+    try std.testing.expectEqual(@as(u32, 2), cuda.configs[0].grid.z);
+    try std.testing.expectEqual(@as(u32, 256), cuda.configs[0].block.x);
+    k.affine_prefill = true;
+    cuda.count = 0;
+    try mm.matmulXs(&k, .{}, 4096, 1024, w, 65536, 131072, 640, true, true, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), cuda.count);
+    try std.testing.expectEqual(@as(u32, 6128), cuda.symbols[0]);
+    try std.testing.expectEqual(@as(u32, 1), cuda.configs[0].grid.z);
+    try std.testing.expectEqual(@as(u32, 5), cuda.configs[0].grid.y);
+    const expanded: mm.Tiled = .{ .w = 0, .n = 12576, .k = 4096, .bits = 4, .format = .affine4 };
+    try std.testing.expectEqual(@as(usize, 4 * 127 * 12576 * 4), mm.planPartBytes(640, expanded));
+    try std.testing.expect(!kernels.affine_xs and !kernels.affine_shapes and !kernels.affine_prefill);
+}
+
+test "Mia Q4 shape table covers forced splits and the distinct fallback minimum" {
+    for ([_][3]usize{ .{ 12576, 4096, 4 }, .{ 4096, 4096, 2 }, .{ 2048, 4096, 4 }, .{ 8192, 1536, 4 }, .{ 8192, 512, 4 }, .{ 4096, 8192, 8 }, .{ 4096, 1024, 2 }, .{ 128, 512, 1 } }) |s|
+        try std.testing.expectEqual(s[2], mm.affineSplitK(s[0], s[1]));
+    var k = kernels;
+    k.affine_rows = kernels.by_rows;
+    k.affine_xs_rows = kernels.by_rows;
+    k.affine_wide_s6 = .{ .id = 5006 };
+    k.affine_shapes = true;
+    cuda.count = 0;
+    try mm.matmulXs(&k, .{}, 4096, 8192, .{ .w = 8192, .s = 12288, .n = 4096, .k = 8192, .bits = 4, .format = .affine4 }, 65536, 131072, 1, true, false, 262144, 0);
+    try std.testing.expectEqual(@as(u32, 5006), cuda.symbols[0]);
+    try std.testing.expectEqual(@as(u32, 32), cuda.configs[0].grid.x);
+    try std.testing.expectEqual(@as(u32, 8), cuda.configs[0].grid.z);
+    try std.testing.expectEqual(@as(u32, 128), cuda.configs[0].block.x);
+    try std.testing.expectEqual(mm.affineWideSharedBytes() / 4 * 6, cuda.configs[0].shared);
+}

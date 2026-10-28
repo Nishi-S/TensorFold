@@ -8,6 +8,9 @@ The reference recipe is Mia revision `bf5f94523a8251029cedae86bf61f8ce37fac218`.
 These experiments are unqualified until the device and model checks below run.
 Current host/compiler evidence is in [the catch-up receipt](glm-mia-catchup-validation.md).
 
+See [the execution-path follow-up](glm-mia-execution.md) for the GPU packer, XS reuse,
+Q4 policies/prefill, direct MoE, graphs, HC and WY experiments and their remaining gates.
+
 ## Implemented catch-up paths
 
 | Native setting | Implementation | Mia source |
@@ -22,7 +25,7 @@ Current host/compiler evidence is in [the catch-up receipt](glm-mia-catchup-vali
 All paths are off by default; the original symmetric formats remain the default.
 Use the same flags on every rank. The rank handshake checks formats, load mode,
 fusion mask and L2 mode/budgets before allocating weights. This fork's handshake
-layout is 13: do not mix its ranks with older binaries.
+layout is 14: do not mix its ranks with older binaries.
 
 `TF_EXL3_DECODE_LOADS=baseline` selects the original loads; `scalar` retains the
 first-stage one-step scalar prefetch. The legacy `TF_EXL3_DECODE_PREFETCH=1`
@@ -50,15 +53,17 @@ FP8 keeps Mia's per-128 scale storage but scales each 64-value product group.
 Both new formats retain shape-selected K slices across prompt/decode. Matrices
 needing split K default to 64-row windows and ordered reduction; the opt-in
 `TF_GLM_PACKED_PROMPT_BATCH=1` experiment uses at most 127 rows. Unsplit large
-calls use 128-row blocks. Mia's single-kernel sequential prompt folding is not
-ported, so this correctness-first prompt implementation may have extra launches.
+calls use 128-row blocks. The default retains this grouped arithmetic. The separate
+`TF_GLM_AFFINE_PREFILL=1` route uses BF16 reconstructed weights and one FP32
+accumulator chain, with its own pending numerical qualification.
 
 Native already compresses dense weights after loading and uses partials plus an
 ordered reduction instead of thread-block clusters. Mia 0103's no-cluster policy
 is therefore already represented architecturally; its speedup is not claimed.
 This patch covers the priority paths above, not all 123 Python recipe patches.
-The specialized FP8 `kv_b` path and per-shape dense launch tuning remain outside
-this patch; they must not be inferred from the FP8 head setting.
+The specialized FP8 `kv_b` path is not the compared Mia recipe's default (it keeps
+`kv_b` in BF16). Q4 shape and prompt policies now have separate opt-in routes in
+the execution follow-up; the FP8 head setting alone does not enable them.
 
 Issue [#2](https://github.com/Nishi-S/TensorFold/issues/2) reports a reproducible
 SM121 generic FP32 gate/up fusion byte-equality failure with nvcc 13.3.73;

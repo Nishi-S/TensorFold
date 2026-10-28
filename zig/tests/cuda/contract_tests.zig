@@ -60,15 +60,12 @@ const q35_contiguous = @import("contract_q35_contiguous.zig");
 const contract = core.contract;
 const g = contract.gates;
 const kk = cuda.kernels;
-
 const controls = struct {
     pub const bytes align(16) = @embedFile("fatbin_contract_controls").*;
 };
-
 const h3_image = struct {
     pub const bytes align(16) = @embedFile("fatbin_h3").*;
 };
-
 /// Gates 1-4 on every registered CUDA kernel and each control at its own gate, then gate 5 on this GPU.
 pub fn run(gpu: check.Gpu) !void {
     const a = gpu.gpa;
@@ -104,6 +101,9 @@ pub fn run(gpu: check.Gpu) !void {
     defer rank_sum.unload();
     var kernels: std.ArrayList(g.Kernel) = .empty;
     defer kernels.deinit(a);
+    var execution: @import("contract_glm_execution.zig").Group = .{};
+    defer execution.deinit();
+    try execution.add(gpu, s, &kernels);
     var mia_formats: @import("contract_mia_formats.zig").Group = .{};
     defer mia_formats.deinit();
     try mia_formats.add(gpu, s, &kernels);
@@ -530,6 +530,7 @@ pub fn run(gpu: check.Gpu) !void {
     defer f32w_control.deinit();
     try kernels.append(a, f32w_control.kernel());
     const glm_fns = try glm.glue.Kernels.load(glm_glue);
+    try execution.addMoe(gpu, s, &glm_fns, &kernels);
     var glm_lat = glm_pages_k.LatWrite{ .rig = .{ .gpu = gpu, .s = s }, .f = glm_fns.lat_write };
     defer glm_lat.deinit();
     try kernels.append(a, glm_lat.kernel());
@@ -590,7 +591,6 @@ pub fn run(gpu: check.Gpu) !void {
     std.debug.print("SUMMARY {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: {d} red as planted, {d} missed; {d} limit problems; gates {d} ms, limits {d} ms\n", .{ t.kernels, t.passed, t.failed, t.known, t.controls, t.caught, t.missed, lim, @divTrunc(t1 - t0, std.time.ns_per_ms), @divTrunc(t2 - t1, std.time.ns_per_ms) });
     try check.expect(t.problems() + lim == 0, "kernel-contract: {d} gate failures, {d} controls missed, {d} limit problems", .{ t.failed, t.missed, lim });
 }
-
 /// The named embedded image and gate 5: in the contract's own file, so the gates' registrations stay short.
 pub const image = @import("contract_limits.zig").image;
 pub const live = @import("contract_limits.zig").live;

@@ -59,6 +59,14 @@ pub const Kernels = struct {
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
     packed_prompt_batch: bool = false, // opt-in affine/FP8 split windows using two 64-row blocks
+    affine_xs: bool = false,
+    affine_shapes: bool = false,
+    affine_prefill: bool = false,
+    affine_xs_rows: ?[4]cuda.Function = null,
+    affine_sums: ?cuda.Function = null,
+    affine_wide: ?cuda.Function = null,
+    affine_wide_s6: ?cuda.Function = null,
+    affine_prompt: ?[2]cuda.Function = null,
     affine_rows: ?[4]cuda.Function = null,
     affine_tile: ?cuda.Function = null,
     fp8_rows: ?[4]cuda.Function = null,
@@ -99,6 +107,23 @@ pub const Kernels = struct {
             try rows[i].allowDynamicShared(affineSharedBytes(bm));
         }
         k.affine_rows = rows;
+        var xs_rows: [4]cuda.Function = undefined;
+        inline for (.{ 16, 32, 64, 128 }, 0..) |bm, i| {
+            xs_rows[i] = try m.function(std.fmt.comptimePrint("glm_affine_xs{d}", .{bm}));
+            try xs_rows[i].allowDynamicShared(affineSharedBytes(bm));
+        }
+        k.affine_xs_rows = xs_rows;
+        k.affine_sums = try m.function("glm_affine_sums");
+        k.affine_wide = try m.function("glm_affine_wide16");
+        try k.affine_wide.?.allowDynamicShared(affineWideSharedBytes());
+        k.affine_wide_s6 = try m.function("glm_affine_wide16s6");
+        try k.affine_wide_s6.?.allowDynamicShared(affineWideSharedBytes() / 4 * 6);
+        var prompt: [2]cuda.Function = undefined;
+        inline for (.{ 64, 128 }, 0..) |bm, i| {
+            prompt[i] = try m.function(std.fmt.comptimePrint("glm_affine_prefill{d}", .{bm}));
+            try prompt[i].allowDynamicShared(affinePromptSharedBytes(bm));
+        }
+        k.affine_prompt = prompt;
         k.affine_tile = try m.function("glm_mm_tile_affine4");
     }
 
@@ -143,6 +168,35 @@ pub fn weightSplitK(w: Tiled) usize {
     return sk;
 }
 
+/// Mia v0.6.0 Q4 SHAPE_SK and its eight-group minimum fallback, independent of the native BF16 policy.
+pub fn affineSplitK(n: usize, k: usize) usize {
+    if (k == 4096) {
+        if (n == 4096) return 2;
+        if (n == 2048 or n == 12576) return 4;
+    }
+    if (n == 8192 and (k == 1536 or k == 512)) return 4;
+    if (n == 4096 and k == 8192) return 8;
+    const tiles = (n + 63) / 64;
+    const groups = k / 64;
+    var sk: usize = 1;
+    while (sk < 8 and tiles * sk < split_target and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
+    return sk;
+}
+
+pub fn affinePromptSharedBytes(bm: usize) u32 {
+    return if (bm == 64) 4 * (64 * 128 + 8 * 32 * 2 * 4 + 2 * 64 * 2 + 64 * 4) else 2 * (128 * 128 + 16 * 32 * 2 * 4 + 2 * 128 * 2 + 128 * 4);
+}
+
+pub fn affineWideSharedBytes() u32 {
+    return 4 * (16 * 128 + 16 * 32 * 2 * 4 + 2 * 128 * 2 + 16 * 4);
+}
+
+/// Scratch reserves both native and optional Q4 split policies, including the 127-row window.
+pub fn planPartBytes(m: usize, w: Tiled) usize {
+    const sk = @max(weightSplitK(w), if (w.format == .affine4) affineSplitK(w.n, w.k) else 1);
+    return if (sk > 1) sk * @min(m, packed_split_rows) * w.n * 4 else 0;
+}
+
 /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
 pub fn splitK(n: usize, k: usize) usize {
     const tiles = (n + 63) / 64;
@@ -163,20 +217,40 @@ pub fn partBytes(m: usize, w: Tiled) usize {
 
 /// x [m][k] by `w` -> out [m][n]; affine/FP8 always keep shape-fixed K slices, including prompt rows.
 pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, part: u64, m: usize, wide: bool, one: bool) !void {
+    return matmulXs(k, s, x, ldx, w, out, part, m, wide, one, 0, 0);
+}
+
+/// Supplied XS must use native eight-values-per-lane sums; otherwise compute once into the caller-owned scratch.
+pub fn matmulXs(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, part: u64, m: usize, wide: bool, one: bool, supplied_xs: u64, scratch_xs: u64) !void {
     if (w.k % 64 != 0 or w.n % 8 != 0 or x % 16 != 0 or ldx % 8 != 0) return error.BadShape;
     if (w.format == .affine4 and (w.bits != 4 or k.affine_rows == null)) return error.AffineFormatNotLoaded;
     if (w.format == .fp8 and (w.bits != 8 or w.k % 128 != 0 or k.fp8_rows == null)) return error.Fp8FormatNotLoaded;
+    const reconstruct = w.format == .affine4 and k.affine_prefill and one;
+    const reuse = w.format == .affine4 and (k.affine_xs or k.affine_shapes) and !reconstruct;
+    var xs = supplied_xs;
+    if (reuse and xs == 0) {
+        xs = scratch_xs;
+        if (xs == 0) return error.AffineSumsScratchMissing;
+        var sums: cuda.Args = .{};
+        sums.add(x);
+        sums.add(@as(c_longlong, @intCast(ldx)));
+        sums.add(xs);
+        sums.add(@as(c_int, @intCast(m)));
+        sums.add(@as(c_int, @intCast(w.k / 64)));
+        try cuda.launch.launch(k.affine_sums orelse return error.AffineFormatNotLoaded, .{ .grid = .{ .x = @intCast(m), .y = @intCast((w.k / 64 + 15) / 16) }, .block = .{ .x = 128 } }, s, &sums);
+    }
+    const shape_sk = if (w.format == .affine4 and k.affine_shapes) affineSplitK(w.n, w.k) else weightSplitK(w);
     var done: usize = 0;
     const wi = try widthIndex(w.bits);
     while (done < m) { // split windows preserve K slices; unsplit calls may use 128-row blocks
-        const big = if (w.format != .symmetric)
-            m - done >= 128 and weightSplitK(w) == 1
+        const big = reconstruct or if (w.format != .symmetric)
+            m - done >= 128 and shape_sk == 1
         else if (one) !k.prompt_fixed_k else m - done >= 128;
-        const cap: usize = if (k.packed_prompt_batch and w.format != .symmetric and weightSplitK(w) > 1) packed_split_rows else 64;
+        const cap: usize = if (k.packed_prompt_batch and w.format != .symmetric and shape_sk > 1) packed_split_rows else 64;
         const rows = if (big) m - done else @min(m - done, cap);
         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
-        const bm = bucket(i);
-        const sk = if (big) 1 else weightSplitK(w); // new formats only take big blocks when their shape needs one slice
+        const bm = if (reconstruct) @as(usize, if (w.k >= 1024 and ((rows + 127) / 128) * ((w.n + 127) / 128) >= 96) 128 else 64) else bucket(i);
+        const sk = if (big) 1 else shape_sk; // new formats only take big blocks when their shape needs one slice
         const o = out + done * w.n * @as(usize, if (wide) 4 else 2);
         var a: cuda.Args = .{};
         a.add(x + done * ldx * 2);
@@ -190,17 +264,20 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         a.add(@as(c_int, @intCast(w.n)));
         a.add(@as(c_int, @intCast(w.k)));
         a.add(@as(c_int, @intCast(sk)));
-        const cols: u32 = @intCast((w.n + 63) / 64);
+        const wide_tile = reuse and k.affine_shapes and rows <= 16 and ((w.n == 4096 and (w.k == 4096 or w.k == 1024)) or (w.n == 2048 and w.k == 4096) or (w.n == 8192 and w.k == 1536));
+        const deep_tile = reuse and k.affine_shapes and rows <= 16 and w.n == 4096 and w.k == 8192;
+        if (reuse or reconstruct) a.add(if (reconstruct) @as(u64, 0) else xs + done * (w.k / 64) * 4);
+        const cols: u32 = @intCast((w.n + @as(usize, if (wide_tile or deep_tile or (reconstruct and bm == 128)) 127 else 63)) / @as(usize, if (wide_tile or deep_tile or (reconstruct and bm == 128)) 128 else 64));
         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
         if (big and wi == 0 and w.format == .symmetric) {
             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
         } else { // packed prompts take the 128-row bucket's blocks, one slice
-            const f = if (w.format == .affine4) k.affine_rows.?[i] else if (w.format == .fp8) k.fp8_rows.?[i] else if (!one and m <= 16 and w.bits == 4 and k.q4_pair != null)
+            const f = if (reconstruct) (k.affine_prompt orelse return error.AffineFormatNotLoaded)[@intFromBool(bm == 128)] else if (deep_tile) k.affine_wide_s6 orelse return error.AffineFormatNotLoaded else if (wide_tile) k.affine_wide orelse return error.AffineFormatNotLoaded else if (reuse) (k.affine_xs_rows orelse return error.AffineFormatNotLoaded)[i] else if (w.format == .affine4) k.affine_rows.?[i] else if (w.format == .fp8) k.fp8_rows.?[i] else if (!one and m <= 16 and w.bits == 4 and k.q4_pair != null)
                 k.q4_pair.?
             else if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
-            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = switch (w.format) {
+            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (reconstruct or deep_tile) 128 else if (wide_tile or bm > 32) 256 else 128 }, .shared = switch (w.format) {
                 .symmetric => sharedBytes(w.bits, bm),
-                .affine4 => affineSharedBytes(bm),
+                .affine4 => if (reconstruct) affinePromptSharedBytes(bm) else if (deep_tile) affineWideSharedBytes() / 4 * 6 else if (wide_tile) affineWideSharedBytes() else affineSharedBytes(bm),
                 .fp8 => fp8SharedBytes(bm),
             }, .pdl = k.pdl }, s, &a);
         }

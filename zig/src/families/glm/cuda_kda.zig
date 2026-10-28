@@ -7,6 +7,7 @@ pub const dk = 128;
 pub const dv = 128;
 /// Windows of this many rows or more (prefill chunks) take the three-kernel chain (kda.WIDE_ROWS).
 pub const wide_rows = 64;
+pub const wy_shared_bytes = 74372;
 
 /// glm_kda.cu's entries.
 pub const Kernels = struct {
@@ -16,10 +17,20 @@ pub const Kernels = struct {
     prep: cuda.Function,
     step: cuda.Function,
     out: cuda.Function,
+    wy: ?cuda.Function = null,
+    prompt_wy: bool = false,
+
+    pub fn configureWy(k: *Kernels, m: cuda.Module, enabled: bool) !void {
+        k.prompt_wy = enabled;
+        k.wy = if (enabled) try m.function("tf_glm_kda_wy") else null;
+        if (k.wy) |f| try f.allowDynamicShared(wy_shared_bytes);
+    }
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
         inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        k.wy = null;
+        k.prompt_wy = false;
         return k;
     }
 };
@@ -42,6 +53,7 @@ pub const Chain = struct {
     eps: f32,
     lower: f32,
     heads: usize,
+    prompt_position: ?usize = null,
 };
 
 /// Where a chain writes: out bf16, state_out like state_in, and replay's rows: k fp32, v bf16, decay and beta fp32.
@@ -72,7 +84,10 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         b.add(@as(c_int, @intCast(rows)));
         b.add(w.y);
         b.add(s.state_out);
-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
+        if (ks.prompt_wy and c.prompt_position != null) {
+            b.add(@as(c_int, @intCast(c.prompt_position.? % 32)));
+            try cuda.launch.launch(ks.wy orelse return error.KdaWyNotLoaded, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 256 }, .shared = wy_shared_bytes }, stream, &b);
+        } else try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
         var o: cuda.Args = .{};
         o.add(h);
         o.add(w.y);
@@ -112,4 +127,9 @@ pub fn replay(ks: *const Kernels, stream: cuda.Stream, state_in: u64, k: u64, v:
 
 test "the three-kernel chain's step grid is the Python family's" {
     try std.testing.expectEqual(@as(u32, 4), dv / 4 / 8); // DV / 4 / WARPS value rows a block, 8 warps of 4 rows
+}
+
+test {
+    _ = @import("cuda_kda_wy_test.zig");
+    _ = @import("cuda_kda_wy_dispatch_test.zig");
 }

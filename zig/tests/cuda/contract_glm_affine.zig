@@ -16,6 +16,8 @@ pub const Case = struct {
     rig: rig_.Rig,
     k: *const glm.mm.Kernels,
     wide: bool,
+    route: enum { native, xs, shapes, reconstruct } = .native,
+    xs: u64 = 0,
     prompt: bool = false,
     codes: []u32 = &.{},
     tables: []u16 = &.{},
@@ -37,7 +39,7 @@ pub const Case = struct {
 
     pub fn kernel(self: *Case) g.Kernel {
         return .{ .ctx = self, .vt = &vt, .control = if (self.drop_tail) .shapes else null, .spec = .{
-            .name = if (self.drop_tail) "control: GLM affine drops final input" else if (self.prompt) (if (self.wide) "cuda GLM affine prompt FP32" else "cuda GLM affine prompt BF16") else if (self.wide) "cuda GLM affine decode FP32" else "cuda GLM affine decode BF16",
+            .name = if (self.route == .reconstruct) (if (self.wide) "cuda GLM affine reconstructed prompt FP32" else "cuda GLM affine reconstructed prompt BF16") else if (self.route == .xs) (if (self.wide) "cuda GLM affine cached sums FP32" else "cuda GLM affine cached sums BF16") else if (self.route == .shapes) (if (self.wide) "cuda GLM affine shape policy FP32" else "cuda GLM affine shape policy BF16") else if (self.drop_tail) "control: GLM affine drops final input" else if (self.prompt) (if (self.wide) "cuda GLM affine prompt FP32" else "cuda GLM affine prompt BF16") else if (self.wide) "cuda GLM affine decode FP32" else "cuda GLM affine decode BF16",
             .accum = .f32,
             .depth = depth,
             .out = if (self.wide) .f32 else .bf16,
@@ -46,6 +48,7 @@ pub const Case = struct {
                 .{ .rows = 1, .n = 4096, .k = 2048 },  .{ .rows = 3, .n = 4096, .k = 1024 },
                 .{ .rows = 8, .n = 72, .k = 512 },     .{ .rows = 129, .n = 128, .k = 2048 },
                 .{ .rows = 1, .n = 12288, .k = 4096 }, .{ .rows = 3, .n = 4096, .k = 6144 },
+                .{ .rows = 1, .n = 12288, .k = 1024 }, .{ .rows = 1, .n = 4096, .k = 8192 },
             },
         } };
     }
@@ -108,7 +111,8 @@ pub const Case = struct {
         const wt = try self.rig.input(try self.rig.bytes(tiled, words.len * 4));
         const st = try self.rig.input(try self.rig.bytes(ts, scales.len * 2));
         self.w = .{ .w = wt, .s = st, .n = shape.n, .k = shape.k, .bits = 4, .format = .affine4 };
-        self.part = try self.rig.scratch(@max(16, glm.mm.partBytes(shape.rows, self.w)));
+        self.part = try self.rig.scratch(@max(16, glm.mm.planPartBytes(shape.rows, self.w)));
+        self.xs = try self.rig.scratch(shape.rows * (shape.k / 64) * 4);
         self.out = try self.rig.output(self.count() * self.bytes());
         return true;
     }
@@ -118,7 +122,11 @@ pub const Case = struct {
     }
 
     pub fn run(self: *Case) !void {
-        try glm.mm.matmul(self.k, self.rig.s, self.candidate_x, self.stride, self.w, self.out, self.part, self.d.?.shape.rows, self.wide, self.prompt);
+        var kernels = self.k.*;
+        kernels.affine_xs = self.route == .xs;
+        kernels.affine_shapes = self.route == .shapes;
+        kernels.affine_prefill = self.route == .reconstruct;
+        try glm.mm.matmulXs(&kernels, self.rig.s, self.candidate_x, self.stride, self.w, self.out, self.part, self.d.?.shape.rows, self.wide, self.prompt or self.route == .reconstruct, 0, self.xs);
         try self.rig.s.synchronize();
     }
 
@@ -129,6 +137,24 @@ pub const Case = struct {
         const d = self.d.?;
         const sh = d.shape;
         const kg = sh.k / 64;
+        if (self.route == .reconstruct) {
+            for (0..sh.rows) |row| for (0..sh.n) |col| {
+                var sum: f64 = 0;
+                var magnitude: f64 = 0;
+                for (0..sh.k) |j| {
+                    const q: f64 = @floatFromInt((self.codes[(col * sh.k + j) / 8] >> @as(u5, @intCast(4 * (j % 8)))) & 15);
+                    const scale = c.fromBf16(self.tables[col * kg + j / 64]);
+                    const bias = c.fromBf16(self.tables[sh.n * kg + col * kg + j / 64]);
+                    const weight = c.fromBf16(c.toBf16(@floatCast(q * scale + bias)));
+                    const term = c.fromBf16(d.x[row * sh.k + j]) * weight;
+                    sum += term;
+                    magnitude += @abs(term);
+                }
+                want[row * sh.n + col] = sum;
+                mag[row * sh.n + col] = magnitude;
+            };
+            return;
+        }
         for (0..sh.rows) |row| for (0..sh.n) |col| {
             var total: f64 = 0;
             var magnitude: f64 = 0;

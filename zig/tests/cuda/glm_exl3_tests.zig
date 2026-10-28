@@ -101,6 +101,10 @@ const Run = struct { ey: u64, rows: usize };
 
 /// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] fp32, the shared slot left as filled.
 fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool) !Run {
+    return runMode(r, k, ek, s, x, pk, rows, prompt, false);
+}
+
+fn runMode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool, direct: bool) !Run {
     const P = rows * glm.exl3.top_k;
     const tile: usize = if (prompt) glm.experts.staged_tile else glm.experts.tile;
     const wide = P > cuda.grouped.small;
@@ -111,11 +115,15 @@ fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: S
         .rank = try r.zeros((if (wide) P else 1) * 4),
         .hist = try r.zeros((if (wide) (P + 1023) / 1024 * E else 1) * 4),
     };
-    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx);
+    const sz = if (direct) glm.exl3.scratchBytesDirect(rows, D, N, prompt, s.shx) else glm.exl3.scratchBytes(rows, D, N, prompt, s.shx);
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * D * 4);
     const xd = try r.zeros(P * N * 2);
-    try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, D, N, limit, prompt, ey, xd);
+    if (direct) {
+        const compact = try r.a.alloc(i32, rows * (slots - 1));
+        for (0..rows) |row| @memcpy(compact[row * (slots - 1) ..][0 .. slots - 1], pk[row * slots ..][0 .. slots - 1]);
+        try glm.exl3.runDirect(k, ek, r.s, s.experts(), sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(compact)), rows, E, D, N, limit, prompt, ey);
+    } else try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, D, N, limit, prompt, ey, xd);
     try r.s.synchronize();
     return .{ .ey = ey, .rows = rows };
 }
@@ -209,6 +217,10 @@ pub fn run_(gpu: Gpu) !void {
             const pk = try picks(&r, rows);
             const got = try run(&r, &k, &ek, s, x, pk, rows, false);
             try expect(&r, if (one) "glm-exl3 decode, one rotation" else "glm-exl3 decode, a rotation an expert", got, s, x, pk);
+            const direct = try runMode(&r, &k, &ek, s, x, pk, rows, false, true);
+            const routed = try r.back(direct.ey, rows * (slots - 1) * D * 4);
+            const expanded = try r.back(got.ey, rows * slots * D * 4);
+            for (0..rows) |row| try check.sameBytes("direct EXL3 decode", routed[row * (slots - 1) * D * 4 ..][0 .. (slots - 1) * D * 4], expanded[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]);
             if (rows > 1) { // every row's bits as alone
                 const all = try r.back(got.ey, rows * slots * D * 4);
                 for (0..rows) |row| {
@@ -231,6 +243,15 @@ pub fn run_(gpu: Gpu) !void {
                     try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
                 }
             }
+        }
+        for ([_]usize{ 1024, 1862 }) |rows| {
+            const x = try r.bfs(rows * D, 1.0);
+            const pk = try picks(&r, rows);
+            const old = try run(&r, &k, &ek, s, x, pk, rows, true);
+            const direct = try runMode(&r, &k, &ek, s, x, pk, rows, true, true);
+            const a = try r.back(old.ey, rows * slots * D * 4);
+            const b = try r.back(direct.ey, rows * (slots - 1) * D * 4);
+            for (0..rows) |row| try check.sameBytes("direct EXL3 whole prompt", b[row * (slots - 1) * D * 4 ..][0 .. (slots - 1) * D * 4], a[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]);
         }
     }
     { // a NaN in one row's input: that row's routed slots NaN, every other row finite

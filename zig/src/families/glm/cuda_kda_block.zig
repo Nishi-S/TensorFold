@@ -60,12 +60,16 @@ pub fn body(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer
 }
 
 pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof) !void {
+    return bodyProfileAt(set, ks, stream, l, s, x, x_stride, rows, conv_state, state_in, wide, prompt, profile, null);
+}
+
+pub fn bodyProfileAt(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, prompt_position: ?usize) !void {
     var stamp = prof.span(profile, stream, .projections);
     try project(set, stream, l, s, x, x_stride, rows);
     stamp.end();
     stamp = prof.span(profile, stream, .kda);
     defer stamp.end();
-    try chainRows(ks, stream, l, s, rows, conv_state, state_in, wide);
+    try chainRowsAt(ks, stream, l, s, rows, conv_state, state_in, wide, if (prompt) prompt_position else null);
     if (prompt) try glue.convShift(set, stream, conv_state, s.p, rows, rows * l.width(), l.width(), 1, 3 * l.heads * kda.dk);
 }
 
@@ -107,10 +111,15 @@ fn columns(set: glue.Set, stream: cuda.Stream, src: u64, cols: usize, dst: u64, 
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.
 pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool) !void {
+    return chainRowsAt(ks, stream, l, s, rows, conv_state, state_in, wide, null);
+}
+
+/// Prompt positions select WY32 boundaries; null keeps the exact serial decode/replay arithmetic.
+pub fn chainRowsAt(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt_position: ?usize) !void {
     const n = l.heads * kda.dk;
     const fa = 3 * n;
-    const c: kda.Chain = .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
-    try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+    const c: kda.Chain = .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads, .prompt_position = prompt_position };
+    try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows or (ks.prompt_wy and prompt_position != null)) s.wide else null);
 }
 
 test {

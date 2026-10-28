@@ -10,7 +10,7 @@ const fp8 = @import("contract_glm_fp8.zig");
 pub const Group = struct {
     module: ?cuda.Module = null,
     mm: glm.mm.Kernels = undefined,
-    affine_cases: [5]affine.Case = undefined,
+    affine_cases: [11]affine.Case = undefined,
     fp8_cases: [3]fp8.Case = undefined,
     ready: bool = false,
 
@@ -31,6 +31,7 @@ pub const Group = struct {
             .rig = .{ .gpu = gpu, .s = stream },
             .k = &self.mm,
             .wide = i % 2 == 1 or i == 4,
+            .route = if (i < 5) .native else if (i < 7) .xs else if (i < 9) .shapes else .reconstruct,
             .prompt = i == 2 or i == 3,
             .drop_tail = i == 4,
         };
