@@ -24,6 +24,7 @@ const prof_mod = @import("cuda_prof.zig");
 const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const shared = @import("cuda_shared.zig");
+pub const l2_prefetch = @import("cuda_l2_prefetch.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -47,6 +48,8 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    l2: ?l2_prefetch.Prefetch = null,
+    moe_direct: bool = false,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -75,7 +78,16 @@ pub const Modules = struct {
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.l2 = null;
+        m.moe_direct = false;
         return m;
+    }
+
+    /// Configure the optional owner from the rank-agreed settings before preparing its weight ranges.
+    pub fn configureL2(m: *Modules, d: *const cuda.Driver, settings: l2_prefetch.policy.Settings) !void {
+        if (m.l2) |*p| p.deinit();
+        m.l2 = null;
+        if (settings.mode != .disabled) m.l2 = try l2_prefetch.Prefetch.init(d, settings);
     }
 
     /// What weights.load runs: the dense packing, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
@@ -88,6 +100,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.l2) |*p| p.deinit();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
@@ -184,7 +197,16 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
+        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .affine_xs_scratch = f.ranks[0].b.affine_xs };
+    }
+
+    /// HC and the 4096-wide RMS norm publish the native eight-values-per-lane affine sums.
+    pub fn inputSet(f: *const Forward, r: Rank, rows: usize) glue.Set {
+        var result = f.set();
+        result.affine_xs_scratch = r.b.affine_xs;
+        const d = r.w.config.hidden;
+        if (d == 4096) result.affine_input = .{ .x = r.b.normed, .xs = r.b.xs, .stride = d, .k = d, .rows = rows };
+        return result;
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
@@ -247,12 +269,12 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
+                try kda_block.bodyProfileAt(f.inputSet(r, rows), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof, if (b.prefill) st.pos else null);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
-                try dsa_block.body(.{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof }, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                try dsa_block.body(.{ .set = f.inputSet(r, rows), .ops = f.m.ops(), .prof = f.prof }, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
         }
@@ -264,14 +286,18 @@ pub const Forward = struct {
         defer stamp.end();
         const c = &r.w.config;
         const b = r.b;
+        var mk = f.mlpKernels();
+        mk.set = f.inputSet(r, rows);
+        var ek = f.moeKernels();
+        ek.set = f.inputSet(r, rows);
         switch (l.ffn) {
             .dense => |m| {
-                try mlp.body(f.mlpKernels(), f.stream, m, b.dense, b.normed, c.hidden, rows, b.prefill);
-                if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows, b.prefill, o);
+                try mlp.body(mk, f.stream, m, b.dense, b.normed, c.hidden, rows, b.prefill);
+                if (out) |o| try mlp.fill(mk, f.stream, m, b.dense, 0, rows, b.prefill, o);
             },
             .moe => |m| {
-                try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
-                if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
+                try moe.body(ek, f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
+                if (out) |o| try moe.fill(ek, f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
             },
         }
     }
@@ -281,7 +307,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .direct = f.m.moe_direct };
     }
 
     pub const Site = enum { mixer, ffn };
@@ -384,6 +410,11 @@ pub const Forward = struct {
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
         const R = ids.len;
+        const pf: ?*const l2_prefetch.Prefetch = if (f.m.l2) |*p|
+            (if (try p.active(f.stream, R, f.ranks[0].b.prefill)) p else null)
+        else
+            null;
+        errdefer if (pf) |p| p.drain();
         for (f.ranks) |r| {
             if (R == 0 or R > r.b.rows) return error.BadWindow;
             if (r.segs.len == 0) {
@@ -393,6 +424,11 @@ pub const Forward = struct {
             } else try shared.begin(r, R, f.stream);
             try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
         }
+        try f.runPrepared(R, pf);
+    }
+
+    /// Device-only forward after input upload and state preparation; graph replay repeats only these operations.
+    pub fn runPrepared(f: *const Forward, R: usize, pf: ?*const l2_prefetch.Prefetch) !void {
         const c = &f.ranks[0].w.config;
         const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
@@ -402,13 +438,14 @@ pub const Forward = struct {
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R, pf);
         try f.finish(R);
         if (f.prof) |p| p.mark(f.stream, .head);
+        if (pf) |p| try p.finish(f.stream);
     }
 
     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
-    fn whole(f: *const Forward, R: usize) !void {
+    fn whole(f: *const Forward, R: usize, pf: ?*const l2_prefetch.Prefetch) !void {
         const c = &f.ranks[0].w.config;
         var li: usize = 0;
         var di: usize = 0;
@@ -430,6 +467,7 @@ pub const Forward = struct {
                 try f.ffn(r, l, R, slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
+            if (pf) |p| try p.site(f.stream, j);
             try f.gather(R);
             for (f.ranks) |r| try f.post(r, R);
             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
@@ -472,6 +510,15 @@ pub const Forward = struct {
             try r.st.readyMtp(f.stream, n);
             try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
             if (h != r.b.hin) try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(r.b.hin, h, n * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+        }
+        try f.mtpPrepared(n);
+    }
+
+    /// Device-only MTP after ids and hidden rows are in their stable buffers.
+    pub fn mtpPrepared(f: *const Forward, n: usize) !void {
+        const c = &f.ranks[0].w.config;
+        const D: usize = c.hidden;
+        for (f.ranks) |r| {
             const m = r.w.mtp.?;
             const b = r.b;
             try glue.embedB16(f.set(), f.stream, b.ids, r.w.embed, b.me, n, D, 1);

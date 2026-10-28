@@ -76,7 +76,7 @@ pub fn run(e: *Engine, want: Want, next: []const u32) !void {
     var r: usize = 0;
     while (r < next.len) : (r += rows) {
         const n = @min(rows, next.len - r);
-        // as the head's last-row pass (Forward.finish); its column count takes no K slices (the test below)
+        // As Forward.finish; high TP head shards may split K, covered by bp's head scratch budget.
         try projection.matmul(projectionSet(e), e.stream, e.w.head, e.bp.fnormed + r * D * 2, D, columns, e.bp.kda.mm_part, n, e.share.vocab.len(), D, false);
         try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = columns }}, n, full);
         const reader = want.reader orelse continue;

@@ -1,6 +1,7 @@
 //! GLM-5.3-Flash's per-rank CUDA memory: forward Buffers (shared by sequences) and a sequence's State, an arena each.
 
 const std = @import("std");
+const Execution = @import("cuda_mia_settings.zig").Execution;
 const cuda = @import("cuda");
 const exl3 = @import("cuda_exl3.zig");
 const weights = @import("cuda_weights.zig");
@@ -104,7 +105,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+fn b16Shapes(w: *const weights.Weights) [14][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -116,6 +117,8 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
         if (c.exl3) .{ 2 * s.dense.len(), c.hidden } else .{ c.hidden, 2 * c.hidden }, // bf16 dense layers: [gate | up]
         if (c.exl3) .{ c.hidden, s.dense.len() } else .{ c.hidden, 2 * c.hidden }, // and down
+        .{ c.hidden, s.shared.len() }, // shared expert down
+        .{ s.vocab.len(), c.hidden }, // head, including packed prompt-logprob passes at high TP
     };
 }
 
@@ -131,6 +134,54 @@ test "GLM TP3: existing scratch covers raw projections through the 127-row split
             for (shapes[0..2]) |shape| try std.testing.expect(b16.partBytes(rows, shape[0], shape[1]) <= planned);
         }
     }
+}
+
+test "GLM TP1-16: packed split windows and actual head fit native scratch planner" {
+    const mm = @import("cuda_mm.zig");
+    const Share = @import("cuda_shard.zig").Share;
+    try std.testing.expect(mm.packed_split_rows <= b16.rows_from - 1);
+    for ([_]bool{ false, true }) |exl3_format| for (1..17) |world| for (0..world) |rank| {
+        const c: @import("config.zig").Config = .{ .exl3 = exl3_format, .head_unit = if (exl3_format) 128 else 64 };
+        const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, world) };
+        for ([_]usize{ 1, 8, 64, 126, 127, 128, 129, 254, 255, 256, 257, 1862, 2048 }) |rows| {
+            var planned: usize = 4;
+            for (b16Shapes(&w)) |shape| planned = @max(planned, b16.partBytes(@min(rows, b16.rows_from - 1), shape[0], shape[1]));
+            for (b16Shapes(&w)) |shape| for ([_]mm.Format{ .affine4, .fp8 }) |format| {
+                const tiled: mm.Tiled = .{ .w = 0, .n = shape[0], .k = shape[1], .format = format };
+                try std.testing.expect(mm.partBytes(rows, tiled) <= planned);
+            };
+            // Check actual callers independently of the planner's shape list.
+            for ([_][2]usize{ .{ c.hidden, w.share.shared.len() }, .{ w.share.vocab.len(), c.hidden } }) |shape| {
+                const tiled: mm.Tiled = .{ .w = 0, .n = shape[0], .k = shape[1], .bits = 8, .format = .fp8 };
+                try std.testing.expect(mm.partBytes(rows, tiled) <= planned);
+            }
+            if (exl3_format and world == 16 and rank == 0 and rows == 127)
+                try std.testing.expectEqual(@as(usize, 9_883_648), planned);
+            if (world == 2 and rows == 127)
+                try std.testing.expectEqual(@as(usize, 8_323_072), planned);
+        }
+    };
+}
+
+fn packedWorkspace(shapes: []const [2]usize, rows: usize, execution: Execution) [2]usize {
+    var out: [2]usize = .{ 4, 4 };
+    for (shapes) |shape| {
+        if (execution.affine_xs or execution.affine_shapes) out[1] = @max(out[1], rows * (shape[1] / 64) * 4);
+        if (execution.affine_shapes) out[0] = @max(out[0], @import("cuda_mm.zig").planPartBytes(rows, .{ .w = 0, .n = shape[0], .k = shape[1], .bits = 4, .format = .affine4 }));
+    }
+    return out;
+}
+
+test "GLM TP3: shape-only experiment owns full fallback XS and shape partial scratch" {
+    const shapes = [_][2]usize{ .{ 12576, 4096 }, .{ 4096, 16384 } };
+    const off = packedWorkspace(&shapes, 1862, .{});
+    try std.testing.expectEqualDeep([2]usize{ 4, 4 }, off);
+    const shape_only = packedWorkspace(&shapes, 1862, .{ .affine_shapes = true });
+    try std.testing.expectEqual(@as(usize, 1862 * 256 * 4), shape_only[1]);
+    try std.testing.expect(shape_only[0] >= 4 * 127 * 12576 * 4);
+    const sums_only = packedWorkspace(&shapes, 1862, .{ .affine_xs = true });
+    try std.testing.expectEqual(shape_only[1], sums_only[1]);
+    try std.testing.expectEqual(@as(usize, 4), sums_only[0]);
 }
 
 /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.
@@ -162,19 +213,28 @@ pub const Buffers = struct {
     me: u64, // bf16 [rows][dims]: the next tokens' embedding
     mcat: u64, // bf16 [rows][2 dims]: [enorm(me) | hnorm(hin)]
     mx: u64, // bf16 [rows][dims]: its stream
+    affine_xs: u64 = 0,
     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
 
     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
-        return make(d, w, rows, prefill, capacity, rows);
+        return make(d, w, rows, prefill, capacity, rows, .{});
     }
 
     /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `window_rows`.
     pub fn initShared(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
-        return make(d, w, rows, false, capacity, window_rows);
+        return make(d, w, rows, false, capacity, window_rows, .{});
+    }
+
+    pub fn initExecution(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, execution: Execution) !Buffers {
+        return make(d, w, rows, prefill, capacity, rows, execution);
+    }
+
+    pub fn initSharedExecution(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize, execution: Execution) !Buffers {
+        return make(d, w, rows, false, capacity, window_rows, execution);
     }
 
     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize) !Buffers {
+    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, execution: Execution) !Buffers {
         const c = &w.config;
         const s = &w.share;
         const D: usize = c.hidden;
@@ -197,7 +257,13 @@ pub const Buffers = struct {
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
-        const x3: [4]usize = if (c.exl3) exl3.scratchBytes(rows, D, ew, prefill, w.exl3_shx) else @splat(4);
+        const extra = packedWorkspace(&b16Shapes(w), rows, execution);
+        mm = @max(mm, extra[0]);
+        const xs_bytes = extra[1];
+        const x3: [4]usize = if (!c.exl3) @splat(4) else if (execution.moe_direct)
+            exl3.scratchBytesDirect(rows, D, ew, prefill, w.exl3_shx)
+        else
+            exl3.scratchBytes(rows, D, ew, prefill, w.exl3_shx);
         var split = false; // a KDA stack in two parts moves each part's rows through one more buffer
         for (w.layers) |l| split = split or (l.mixer == .kda and l.mixer.kda.proj == .split);
         const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
@@ -239,6 +305,7 @@ pub const Buffers = struct {
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+            xs_bytes,
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &sizes, &p);
@@ -291,6 +358,7 @@ pub const Buffers = struct {
             .mcat = p[68],
             .mx = p[69],
             .part = p[70],
+            .affine_xs = if (execution.affine_xs or execution.affine_shapes) p[76] else 0,
         };
         out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
         out.kda.tmp = p[75];

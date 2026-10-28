@@ -11,14 +11,21 @@ pub const Module = struct {
     }
 };
 pub const Args = struct {
-    pub fn add(_: *Args, _: anytype) void {}
+    values: [16]u64 = @splat(0),
+    len: usize = 0,
+    pub fn add(a: *Args, value: anytype) void {
+        a.values[a.len] = @intCast(value);
+        a.len += 1;
+    }
 };
 pub var configs: [128]Config = undefined;
 pub var symbols: [128]u32 = undefined;
 pub var count: usize = 0;
+pub var args: [128]Args = undefined;
 pub const launch = struct {
-    pub fn launch(f: Function, c: Config, _: Stream, _: *Args) !void {
+    pub fn launch(f: Function, c: Config, _: Stream, a: *Args) !void {
         configs[count] = c;
+        args[count] = a.*;
         symbols[count] = f.id;
         count += 1;
     }

@@ -46,7 +46,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             const w = k.width();
             var s = b.kda;
             s.p = b.kproj;
-            try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
+            try kda_block.project(f.inputSet(r, rows), f.stream, k, s, b.normed, c.hidden, rows);
             for (r.segs) |g| {
                 const st = g.st;
                 const cur = st.cur[li];
@@ -58,7 +58,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 const conv = st.conv + li * 3 * st.conv_c * 2;
                 if (b.prefill) { // a whole prompt: its rows in place, the layer committed now (as Forward.mixer)
                     v.p = b.kproj + g.row0 * w * 2;
-                    try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false);
+                    try kda_block.chainRowsAt(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false, st.pos);
                     try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, 3 * n);
                     st.cur[li] = 1 - cur;
                     continue;
@@ -77,7 +77,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
         .mla => |a| {
             var sparse_any = false;
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
-            try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
+            try dsa_block.prepare(f.inputSet(r, rows), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
             for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
                 try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);

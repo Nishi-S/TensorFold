@@ -4,6 +4,10 @@ const cuda = @import("cuda");
 const weights = @import("cuda_weights.zig");
 const mm_mod = @import("cuda_mm.zig");
 const qpack = @import("cuda_qpack.zig");
+const affine_pack = @import("cuda_affine_pack.zig");
+const fp8_pack = @import("cuda_fp8_pack.zig");
+const pack_timing = @import("cuda_pack_timing.zig");
+pub const Formats = struct { dense: mm_mod.Format = .symmetric, head: mm_mod.Format = .symmetric, affine_prune: bool = false, affine_gpu: bool = false };
 const projection = @import("cuda_proj.zig");
 const Weights = weights.Weights;
 const Layer = weights.Layer;
@@ -93,7 +97,11 @@ fn compact(w: *Weights, d: *const cuda.Driver, s: cuda.Stream, field: *u64, byte
 }
 
 /// Eligible linears tiled in place; uneven KDA inputs and their views stay bf16 for the row-major kernels.
-pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernels, s: cuda.Stream, d: *const cuda.Driver, dense_bits: u8, head_bits: u8) !mm_mod.Packed {
+pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernels, s: cuda.Stream, d: *const cuda.Driver, dense_bits: u8, head_bits: u8, formats: Formats) !mm_mod.Packed {
+    if (formats.dense == .fp8 or formats.head == .affine4) return error.UnsupportedPackedFormat;
+    if (formats.dense == .affine4 and dense_bits != 4) return error.AffineNeedsFourBits;
+    if (formats.head == .fp8 and head_bits != 8) return error.Fp8NeedsEightBits;
+    var timing = pack_timing.Timing.init();
     var list: std.ArrayList(Lin) = .empty;
     defer list.deinit(w.gpa);
     try linears(w, &list);
@@ -108,55 +116,109 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
     defer words.deinit(gpa);
     var scales: std.ArrayList(u16) = .empty;
     defer scales.deinit(gpa);
+    var biases: std.ArrayList(u16) = .empty;
+    defer biases.deinit(gpa);
+    var codes8: std.ArrayList(u8) = .empty;
+    defer codes8.deinit(gpa);
+    var scales8: std.ArrayList(f32) = .empty;
+    defer scales8.deinit(gpa);
+    var packed_formats: std.ArrayList(mm_mod.Format) = .empty;
+    errdefer packed_formats.deinit(gpa);
     var packed_ptrs: std.ArrayList(u64) = .empty;
     errdefer packed_ptrs.deinit(gpa);
     var packed_bits: std.ArrayList(u8) = .empty;
     errdefer packed_bits.deinit(gpa);
+    var gpu_quant: ?@import("cuda_affine_quant.zig").Quantizer = if (formats.affine_gpu) try @import("cuda_affine_quant.zig").Quantizer.init(d) else null;
+    defer if (gpu_quant) |*q| q.deinit();
+    errdefer @import("cuda_load_owner.zig").drain(s, d);
     var freed: usize = 0;
+    timing.mark(.setup);
     for (list.items, 0..) |e, i| {
         const n = e.n;
         const k = e.k;
         const ptr = e.field.*;
-        const bits = if (i + 1 == list.items.len and w.head == .bf16) head_bits else dense_bits; // an MXFP8 head stays
+        const is_head = i + 1 == list.items.len and w.head == .bf16;
+        const bits = if (is_head) head_bits else dense_bits;
+        const format = if (is_head) formats.head else formats.dense;
         if (bits == 16) {
             try mm_mod.tile(mk, s, ptr, tmp.ptr, n, k);
             try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
+            if (timing.enabled) {
+                try s.synchronize();
+                timing.mark(.bf16_tile);
+            }
             continue;
         }
-        try host.resize(gpa, n * k);
-        try s.synchronize();
-        try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
-        try words.resize(gpa, n * k * bits / 32);
-        try scales.resize(gpa, n * (k / 64));
-        qpack.quantize(bits, host.items, n, k, words.items, scales.items);
-        const sizes = mm_mod.packedBytes(n, k, bits); // codes then scales, inside the bf16 tiles' bytes
-        try tmp.upload(0, std.mem.sliceAsBytes(words.items));
-        try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
-        try mm_mod.tilePacked(mk, s, bits, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+        const sizes = mm_mod.formatBytes(n, k, bits, format);
+        if (format == .affine4 and gpu_quant != null) {
+            try gpu_quant.?.run(s, ptr, tmp.ptr, n, k);
+            timing.mark(.affine_quant);
+            try mm_mod.tileAffine(mk, s, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+        } else {
+            try host.resize(gpa, n * k);
+            try s.synchronize();
+            try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
+            timing.mark(.readback);
+            switch (format) {
+                .symmetric, .affine4 => {
+                    try words.resize(gpa, n * k * bits / 32);
+                    try scales.resize(gpa, n * (k / 64));
+                    if (format == .affine4) {
+                        try biases.resize(gpa, scales.items.len);
+                        if (formats.affine_prune) try affine_pack.quantizePruned(host.items, n, k, words.items, scales.items, biases.items) else try affine_pack.quantize(host.items, n, k, words.items, scales.items, biases.items);
+                    } else qpack.quantize(bits, host.items, n, k, words.items, scales.items);
+                    timing.mark(if (format == .affine4) .affine_quant else .symmetric_quant);
+                    try tmp.upload(0, std.mem.sliceAsBytes(words.items));
+                    try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
+                    if (format == .affine4) {
+                        try tmp.upload(sizes[0] + sizes[1], std.mem.sliceAsBytes(biases.items));
+                        try mm_mod.tileAffine(mk, s, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+                    } else try mm_mod.tilePacked(mk, s, bits, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
+                },
+                .fp8 => {
+                    try codes8.resize(gpa, n * k);
+                    try scales8.resize(gpa, n * (k / 128));
+                    try fp8_pack.quantize(host.items, n, k, codes8.items, scales8.items);
+                    timing.mark(.fp8_quant);
+                    try tmp.upload(0, codes8.items);
+                    try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales8.items));
+                    try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, sizes[0] + sizes[1], s.handle), "cuMemcpyDtoDAsync");
+                },
+            }
+        }
         try s.synchronize(); // tmp is the next linear's
-        freed += try compact(w, d, s, e.field, sizes[0] + sizes[1]); // its bf16 bytes back to the device
+        timing.mark(.upload_tile);
+        freed += try compact(w, d, s, e.field, sizes[0] + sizes[1] + sizes[2]); // its bf16 bytes back to the device
+        timing.mark(.compact);
         try packed_ptrs.append(gpa, e.field.*);
         try packed_bits.append(gpa, bits);
+        try packed_formats.append(gpa, format);
     }
     try s.synchronize();
-    if (packed_ptrs.items.len > 0) std.log.info("glm: {d} linears packed ({d}/{d} bits), {d:.2} GiB freed", .{ packed_ptrs.items.len, dense_bits, head_bits, @as(f64, @floatFromInt(freed)) / (1 << 30) });
+    if (packed_ptrs.items.len > 0) std.log.info("glm: {d} linears packed (dense {t}/{d}, head {t}/{d}), {d:.2} GiB freed", .{ packed_ptrs.items.len, formats.dense, dense_bits, formats.head, head_bits, @as(f64, @floatFromInt(freed)) / (1 << 30) });
     // sorted by pointer, the bits beside them (Packed.tiled searches)
     const ptrs = try packed_ptrs.toOwnedSlice(gpa);
     errdefer gpa.free(ptrs);
     const bits_out = try packed_bits.toOwnedSlice(gpa);
+    errdefer gpa.free(bits_out);
+    const formats_out = try packed_formats.toOwnedSlice(gpa);
     const Ctx = struct {
         p: []u64,
         b: []u8,
+        f: []mm_mod.Format,
         pub fn lessThan(c: @This(), a: usize, b: usize) bool {
             return c.p[a] < c.p[b];
         }
         pub fn swap(c: @This(), a: usize, b: usize) void {
             std.mem.swap(u64, &c.p[a], &c.p[b]);
             std.mem.swap(u8, &c.b[a], &c.b[b]);
+            std.mem.swap(mm_mod.Format, &c.f[a], &c.f[b]);
         }
     };
-    std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out });
-    return .{ .ptrs = ptrs, .bits = bits_out };
+    std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out, .f = formats_out });
+    timing.mark(.setup);
+    timing.report(w.share.rank, list.items.len);
+    return .{ .ptrs = ptrs, .bits = bits_out, .formats = formats_out };
 }
 
 test "GLM TP3: the tiler keeps unsupported KDA input and view weights in row-major order" {

@@ -80,6 +80,7 @@ const Fake = struct {
         f.e.seqs = .empty;
         f.e.pages = null;
         f.e.images = null;
+        f.e.graphs = .{};
         f.e.settings = .{};
         f.e.w = undefined;
         f.e.w.config = .{};

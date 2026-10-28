@@ -55,10 +55,14 @@ pub fn partBytes(m: usize, n: usize, k: usize) usize {
 
 /// qmm.matmul for a B16 weight: out [m][n] bf16 (fp32 with `wide`) = x . w; 128+ rows sum in registers, else `part`.
 pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    return matmulXs(set, stream, x, x_stride, w, out, part, m, n, k, wide, 0);
+}
+
+pub fn matmulXs(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool, xs: u64) !void {
     if (k % bk != 0) return error.KNotMultipleOf64;
     if (set.mm) |mk| { // tiled weights, packed or bf16
         const t: mm.Tiled = if (set.packs) |p| p.tiled(w, n, k) else .{ .w = w, .n = n, .k = k };
-        return mm.matmul(mk, stream, x, x_stride, t, out, part, m, wide, set.prompt);
+        return mm.matmulXs(mk, stream, x, x_stride, t, out, part, m, wide, set.prompt, if (xs != 0) xs else set.affine_input.sums(x, x_stride, k, m), set.affine_xs_scratch);
     }
     const sk = splitK(n, k);
     var a: cuda.Args = .{};

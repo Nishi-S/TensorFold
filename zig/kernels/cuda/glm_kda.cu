@@ -432,3 +432,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
     out_kernel_body(H, y_in, G, g_stride, norm_w, eps, out);
 }
+
+#include "glm_kda_wy.cuh"

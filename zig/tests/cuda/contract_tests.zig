@@ -26,6 +26,7 @@ const h3_topk_k = @import("contract_h3_topk.zig");
 const drama3_k = @import("contract_drama3.zig");
 const ck_k = @import("contract_ck.zig");
 const q35_bf16_k = @import("contract_qwen_bf16.zig");
+const decode_experiments = @import("contract_decode_experiments.zig");
 const e3_k = @import("contract_experts3.zig");
 const scan_k = @import("contract_scan.zig");
 const lane8_k = @import("contract_ck_lane.zig");
@@ -33,11 +34,8 @@ const latent_k = @import("contract_latent.zig");
 const vit_k = @import("contract_vit_glue.zig");
 const act_round_k = @import("contract_act_round.zig");
 const f32w_k = @import("contract_glm_f32w.zig");
-
 const w4a8_k = @import("contract_w4a8.zig");
-
 const round_k = @import("contract_tree_round.zig");
-
 const act_k = @import("contract_act.zig");
 const vit_g4_group = @import("contract_gemma_group.zig");
 const gdn_k = @import("contract_gdn.zig");
@@ -48,11 +46,9 @@ const glm_index_k = @import("contract_glm_index.zig");
 const glm_attn_k = @import("contract_glm_attn.zig");
 const glm = @import("glm_cuda");
 const elementwise_k = @import("contract_elementwise.zig");
-
 const tree_k = @import("contract_tree_attn.zig");
 const block_k = @import("contract_block_attn.zig");
 const q35_k = @import("contract_q35_attn.zig");
-
 const window_k = @import("contract_window.zig");
 const moe_k = @import("contract_moe.zig");
 const qkr_k = @import("contract_qk_round.zig");
@@ -60,20 +56,16 @@ const fact_k = @import("contract_flashnext_fact.zig");
 const route_k = @import("contract_route_rows.zig");
 const fexp_k = @import("contract_flashnext_fexp.zig");
 const glue_k = @import("contract_flashnext_glue.zig");
-
 const q35_contiguous = @import("contract_q35_contiguous.zig");
 const contract = core.contract;
 const g = contract.gates;
 const kk = cuda.kernels;
-
 const controls = struct {
     pub const bytes align(16) = @embedFile("fatbin_contract_controls").*;
 };
-
 const h3_image = struct {
     pub const bytes align(16) = @embedFile("fatbin_h3").*;
 };
-
 /// Gates 1-4 on every registered CUDA kernel and each control at its own gate, then gate 5 on this GPU.
 pub fn run(gpu: check.Gpu) !void {
     const a = gpu.gpa;
@@ -109,6 +101,15 @@ pub fn run(gpu: check.Gpu) !void {
     defer rank_sum.unload();
     var kernels: std.ArrayList(g.Kernel) = .empty;
     defer kernels.deinit(a);
+    var execution: @import("contract_glm_execution.zig").Group = .{};
+    defer execution.deinit();
+    try execution.add(gpu, s, &kernels);
+    var mia_formats: @import("contract_mia_formats.zig").Group = .{};
+    defer mia_formats.deinit();
+    try mia_formats.add(gpu, s, &kernels);
+    var decode_group: decode_experiments.Group = .{};
+    defer decode_group.deinit();
+    try decode_group.add(gpu, s, &kernels);
     var vit = try cuda.vit.Kernels.load(gpu.d);
     defer vit.unload();
     var glue: [12]vit_k.Glue = undefined;
@@ -529,6 +530,7 @@ pub fn run(gpu: check.Gpu) !void {
     defer f32w_control.deinit();
     try kernels.append(a, f32w_control.kernel());
     const glm_fns = try glm.glue.Kernels.load(glm_glue);
+    try execution.addMoe(gpu, s, &glm_fns, &kernels);
     var glm_lat = glm_pages_k.LatWrite{ .rig = .{ .gpu = gpu, .s = s }, .f = glm_fns.lat_write };
     defer glm_lat.deinit();
     try kernels.append(a, glm_lat.kernel());
@@ -589,7 +591,6 @@ pub fn run(gpu: check.Gpu) !void {
     std.debug.print("SUMMARY {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: {d} red as planted, {d} missed; {d} limit problems; gates {d} ms, limits {d} ms\n", .{ t.kernels, t.passed, t.failed, t.known, t.controls, t.caught, t.missed, lim, @divTrunc(t1 - t0, std.time.ns_per_ms), @divTrunc(t2 - t1, std.time.ns_per_ms) });
     try check.expect(t.problems() + lim == 0, "kernel-contract: {d} gate failures, {d} controls missed, {d} limit problems", .{ t.failed, t.missed, lim });
 }
-
 /// The named embedded image and gate 5: in the contract's own file, so the gates' registrations stay short.
 pub const image = @import("contract_limits.zig").image;
 pub const live = @import("contract_limits.zig").live;

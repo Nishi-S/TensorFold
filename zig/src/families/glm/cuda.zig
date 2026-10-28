@@ -3,6 +3,8 @@
 pub const experts = @import("cuda_experts.zig");
 pub const exl3 = @import("cuda_exl3.zig");
 pub const vision = @import("cuda_vision.zig");
+pub const affine_quant = @import("cuda_affine_quant.zig");
+pub const affine_pack_reference = @import("cuda_affine_pack_reference_test.zig");
 pub const mm = @import("cuda_mm.zig");
 pub const vision_config = @import("vision_config.zig");
 pub const image_core = @import("image_core.zig");
@@ -70,6 +72,7 @@ test {
     _ = sampler;
     _ = prompt_logprobs;
     _ = engine;
+    _ = @import("cuda_engine_graph.zig");
     _ = follow;
     _ = lanes;
     _ = native;

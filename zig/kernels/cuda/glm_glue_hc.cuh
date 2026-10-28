@@ -238,3 +238,5 @@ extern "C" __global__ void __launch_bounds__(256)
                           float hc_eps, int nb, int iters) {
   glm_hc::finish(x, part, base, scale, nw, out, xs, post, comb, eps, hc_eps, nb, iters);
 }
+
+#include "glm_glue_hc_fast.cuh"

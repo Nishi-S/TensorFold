@@ -92,6 +92,7 @@ pub const Engine = struct {
     prompt_tried: bool = false, // that pass came: without buffers after it, the passes take the window's
     prompt_out: prompt_lp.Output, // a head pass's logprob words, then its picks, host-mapped (rank 0 reads them)
     structured: bool = false, // a structured output step: every rank's draws gather whole rows, rank 0 masks them
+    graphs: @import("cuda_engine_graph.zig").Cache = .{},
     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
@@ -135,13 +136,28 @@ pub const Engine = struct {
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
-        errdefer m.deinit();
+        var modules_moved = false;
+        errdefer if (modules_moved) e.m.deinit() else m.deinit();
+        try m.configureL2(d, @import("cuda_mia_settings.zig").l2Settings(o.settings));
+        if (o.settings.exl3_loads > 4) return error.BadExl3DecodeLoads;
+        const exl3_mode: cuda.exl3_experts.prefetch.Mode = @fromBackingInt(@intCast(if (o.settings.exl3_loads == 0 and o.settings.exl3_prefetch) @as(u3, 1) else o.settings.exl3_loads));
+        try m.exl3.configure(exl3_mode, o.settings.exl3_fuse);
+        m.mm.packed_prompt_batch = o.settings.packed_prompt_batch;
+        try @import("cuda_execution.zig").configure(&m, o.settings.execution);
+        m.mm.q4_pair = null;
+        if (o.settings.q4_pair_decode) {
+            m.mm.q4_pair = try m.mods[7].function("glm_mm4_pair_16");
+            try m.mm.q4_pair.?.allowDynamicShared(mm_mod.sharedBytes(4, 16));
+        }
+        if (o.settings.dense_format == .affine4 and m.mm.affine_rows == null) try m.mm.loadAffine(m.mods[7]);
+        if (o.settings.head_format == .fp8 and m.mm.fp8_rows == null) try m.mm.loadFp8(m.mods[7]);
         var pieces = try fw.Pieces.init(d, o.settings.pieces);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        modules_moved = true;
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -152,33 +168,36 @@ pub const Engine = struct {
             enabled: bool,
             dense: u8,
             head: u8,
+            formats: tile.Formats,
             packs: *mm_mod.Packed,
             fn apply(t: @This(), w: *weights.Weights) !void {
-                if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head);
+                if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head, t.formats);
             }
         };
-        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
+        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .formats = .{ .dense = o.settings.dense_format, .head = o.settings.head_format, .affine_prune = o.settings.affine_prune, .affine_gpu = o.settings.execution.affine_gpu }, .packs = &e.packs };
         e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);
             gpa.free(e.packs.bits);
+            gpa.free(e.packs.formats);
         }
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        if (e.m.l2) |*p| try p.prepare(gpa, &e.w);
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
             e.seqs.deinit(gpa);
         }
-        e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+        e.bp = try fw.Buffers.initExecution(d, &e.w, fw.prefill_rows, true, o.capacity, o.settings.execution);
         errdefer e.bp.deinit();
-        e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        e.bd = try fw.Buffers.initExecution(d, &e.w, fw.window_rows, false, o.capacity, o.settings.execution);
         errdefer e.bd.deinit();
-        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        e.bm = try fw.Buffers.initExecution(d, &e.w, fw.window_rows, false, o.capacity, o.settings.execution);
         errdefer e.bm.deinit();
-        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        if (o.mtp) e.bs = try fw.Buffers.initSharedExecution(d, &e.w, shared_rows, o.capacity, o.settings.execution);
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
         errdefer e.pairs.free();
@@ -204,8 +223,10 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        e.graphs.clear();
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
+        e.gpa.free(e.packs.formats);
         if (e.drafter) |dr| dr.deinit();
         var it = e.snaps.valueIterator();
         while (it.next()) |s| e.freeSnap(s);
@@ -225,6 +246,7 @@ pub const Engine = struct {
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
+        if (e.m.l2) |*p| p.drain();
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
@@ -282,6 +304,7 @@ pub const Engine = struct {
     fn free(e: *Engine, slot: usize) void {
         const q = e.seqs.items[slot] orelse return;
         cuda.completion.drain(e.d, e.stream, "GLM sequence release did not drain");
+        e.graphs.clear();
         q.st.deinit();
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;
@@ -469,7 +492,7 @@ pub const Engine = struct {
         const at = e.cur.st.pos;
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
-        try f.run(@ptrCast(ids));
+        if (!try @import("cuda_engine_graph.zig").run(e, f, @ptrCast(ids), false, 0)) try f.run(@ptrCast(ids));
         if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         e.cur.rows_at = e.bd.fnormed;
         try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
@@ -535,13 +558,15 @@ pub const Engine = struct {
         var s0: usize = 0;
         while (s0 < next.len) : (s0 += fw.window_rows) {
             const part = next[s0..@min(next.len, s0 + fw.window_rows)];
-            try f.mtp(part, &.{hidden + s0 * D * 2});
+            const h = hidden + s0 * D * 2;
+            if (!try @import("cuda_engine_graph.zig").run(e, f, part, true, h)) try f.mtp(part, &.{h});
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
         for (0..depth) |j| {
             try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
             if (j + 1 < depth) {
-                try f.mtp(@ptrCast(out[j..][0..1]), &.{e.bm.fnormed});
+                const id: []const i32 = @ptrCast(out[j..][0..1]);
+                if (!try @import("cuda_engine_graph.zig").run(e, f, id, true, e.bm.fnormed)) try f.mtp(id, &.{e.bm.fnormed});
                 try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
                 e.cur.in_head += 1;
             }
